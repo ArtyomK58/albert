@@ -85,14 +85,25 @@ class MacNetwork:
 
     def anchor_is_ours(self):
         rules = self.command(['/sbin/pfctl', '-a', ANCHOR, '-sr']).stdout
-        return all('<frog_corp>' in line for line in rules.splitlines() if line.strip())
+        return all(any(t in line for t in ('<frog_corp>', '<frog_corp6>'))
+                   for line in rules.splitlines() if line.strip())
 
-    def guard(self, state, path, interface=None, reserve=MAC_FAILSAFE_RESERVE):
-        # The stock Apple wildcard anchor must already be loaded; never replace pf.conf.
+    def guard_body(self, interface=None):
         prefixes = ', '.join(self.s['corporate_prefixes'])
         qualifier = ('on ! ' + interface + ' ') if interface else ''
         body = 'table <frog_corp> const { ' + prefixes + ' }\n'
+        if self.s.get('transport') == 'tailnet':
+            # This gateway has no corporate IPv6 path. Keep link-local/loopback
+            # discovery, but prevent global/ULA traffic bypassing the selected tunnel.
+            body += 'table <frog_corp6> const { 2000::/3, fc00::/7 }\n'
         body += 'block drop out quick ' + qualifier + 'inet to <frog_corp>\n'
+        if self.s.get('transport') == 'tailnet':
+            body += 'block drop out quick ' + qualifier + 'inet6 to <frog_corp6>\n'
+        return body
+
+    def guard(self, state, path, interface=None, reserve=MAC_FAILSAFE_RESERVE):
+        # The stock Apple wildcard anchor must already be loaded; never replace pf.conf.
+        body = self.guard_body(interface)
         if not state.get('anchor_owned'):
             state['anchor_owned'] = True
             self.save(path, state)  # Ownership is recorded before the anchor exists.
@@ -139,6 +150,8 @@ class MacNetwork:
             raise RuntimeError('pf_anchor_used_by_another_owner')
         if target == 'vps':
             self.vpn_interface()
+        elif self.s.get('transport') == 'tailnet':
+            raise RuntimeError('native_fallback_requires_exit_node_withdrawal')
         for zone in self.s['dns_zones']:
             p = Path(self.c['resolver_dir']) / zone
             if p.exists() and p.read_text() != 'nameserver ' + self.s['corporate_dns'] + '\n':

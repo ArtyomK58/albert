@@ -77,7 +77,11 @@ def validate(c):
     if c.get('version') != 1:
         raise ValueError('unsupported_gateway_version')
     peer = network(c['mac_peer'])
-    if peer.prefixlen != 32 or not any(peer.subnet_of(p) for p in PRIVATE):
+    transport = c.get('transport', 'personal_vpn')
+    if transport not in ('personal_vpn', 'tailnet'):
+        raise ValueError('unsupported_gateway_transport')
+    pools = (ipaddress.ip_network('100.64.0.0/10'),) if transport == 'tailnet' else PRIVATE
+    if peer.prefixlen != 32 or not any(peer.subnet_of(p) for p in pools):
         raise ValueError('single_private_peer_required')
     prefixes = sorted(set(network(p) for p in c['corporate_prefixes']), key=str)
     if not prefixes:
@@ -95,7 +99,7 @@ def validate(c):
             raise ValueError('corporate_route_overlaps_protected_network')
     for key in ('container', 'host_bridge', 'host_veth', 'namespace', 'namespace_veth', 'tunnel'):
         identifier(c[key])
-    if not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', c.get('container_mac', '')):
+    if transport != 'tailnet' and not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', c.get('container_mac', '')):
         raise ValueError('container_identity_required')
     if c.get('ipv6_policy') != 'deny':
         raise ValueError('ipv6_requires_separate_acceptance')
@@ -118,6 +122,18 @@ def validate(c):
 
 def render(c):
     prefixes = validate(c)
+    if c.get('transport') == 'tailnet':
+        from types import SimpleNamespace
+        from tailnet_guard import TailnetGuard
+        guard = TailnetGuard(SimpleNamespace(spec=c))
+        return {'schema': 1, 'state': 'staged', 'applied': False, 'transport': 'tailnet',
+                'guard_block': guard.render(False, False), 'guard_active': guard.render(True, True),
+                'executor': 'gateway_hook.NetworkHook', 'operations': [],
+                'host_return_route': 'owned by overlay; never replaced by gateway',
+                'container_changes': False,
+                'mac': {'route_prefixes': [str(p) for p in prefixes], 'live_files_written': False},
+                'acceptance_required': ['early-filter-peer-isolation', 'overlay-nat-preserves-source',
+                                        'dns-fail-closed', 'ipv6-no-leak', 'mfa-single-session']}
     peer = c['mac_peer']
     table, priority = str(c['table']), str(c['rule_priority'])
     ns = ['ip', 'netns', 'exec', c['namespace']]

@@ -12,6 +12,7 @@ import time
 
 from gateway_plan import (Deadline, HOOK_BUDGET, HOOK_LOCK_WAIT, HOST_COMMAND_TIMEOUT, HOST_FAILSAFE_RESERVE,
                           MAC_CALL_TIMEOUT, MAC_LINK_EXEC_TIMEOUT, acquire, validate)
+from tailnet_guard import TailnetGuard
 
 PHASES = ('preflight', 'block', 'activate', 'verify', 'recover')
 HOST_CHAIN = 'FROG_CG_HOST'
@@ -70,6 +71,8 @@ class NetworkHook:
             self.command(base + ['-I', hook, '1', '-j', name], reserve=reserve)
 
     def drop_chain(self, prefix, table, name, hook):
+        if not prefix and name == HOST_CHAIN and self.spec.get('transport') == 'tailnet':
+            return TailnetGuard(self).remove(HOST_FAILSAFE_RESERVE)
         base = prefix + ['iptables', '-w', '-t', table]
         for _ in range(8):
             if self.command(base + ['-C', hook, '-j', name], check=False).returncode:
@@ -80,6 +83,8 @@ class NetworkHook:
             self.command(base + ['-X', name])
 
     def host_filter(self, active, reserve=HOST_FAILSAFE_RESERVE):
+        if self.spec.get('transport') == 'tailnet':
+            return TailnetGuard(self).apply(active, reserve)
         s = self.spec
         # Preserve replies to namespace-owned outbound connections, including the
         # corporate VPN's encrypted transport, even while peer forwarding is blocked.
@@ -180,9 +185,18 @@ class NetworkHook:
         s = self.spec
         if self.command(['sysctl', '-n', 'net.ipv4.ip_forward']).stdout.strip() != '1':
             raise RuntimeError('shared_forwarding_must_already_be_enabled')
-        data = json.loads(self.command(['docker', 'inspect', s['container']]).stdout)[0]
-        found = any(n.get('IPAddress') == s['container_address'] and n.get('MacAddress', '').lower() == s['container_mac'].lower()
-                    for n in data['NetworkSettings']['Networks'].values())
+        tailnet = s.get('transport') == 'tailnet'
+        if tailnet:
+            data = json.loads(self.command(['tailscale', 'status', '--json']).stdout)
+            peer = str(ipaddress.ip_network(s['mac_peer']).network_address)
+            found = any(n.get('ID') == s.get('tailnet_node_id') and n.get('Online') and peer in n.get('TailscaleIPs', [])
+                        for n in (data.get('Peer') or {}).values())
+            route = self.ip_json(['ip', '-j', 'route', 'get', peer])
+            found = found and bool(route) and route[0].get('dev') == s['host_bridge']
+        else:
+            data = json.loads(self.command(['docker', 'inspect', s['container']]).stdout)[0]
+            found = any(n.get('IPAddress') == s['container_address'] and n.get('MacAddress', '').lower() == s['container_mac'].lower()
+                        for n in data['NetworkSettings']['Networks'].values())
         if not found:
             raise RuntimeError('container_topology_changed')
         owner = self.owner()
@@ -195,9 +209,11 @@ class NetworkHook:
                 raise RuntimeError('routing_resource_already_owned')
             if self.ip_json(['ip', '-j', 'route', 'show', 'table', str(s['table'])]):
                 raise RuntimeError('routing_table_already_owned')
-            if self.command(['iptables', '-S', HOST_CHAIN], check=False).returncode == 0:
+            if tailnet and TailnetGuard(self).inspect(HOST_FAILSAFE_RESERVE) is not None:
                 raise RuntimeError('firewall_resource_already_owned')
-            if self.return_route()[0]:
+            if not tailnet and self.command(['iptables', '-S', HOST_CHAIN], check=False).returncode == 0:
+                raise RuntimeError('firewall_resource_already_owned')
+            if not tailnet and self.return_route()[0]:
                 raise RuntimeError('return_route_already_owned')
         # Acceptance must explicitly cover cryptokey peer isolation and the private supervisor.
         if not all(self.c.get(k) is True for k in ('peer_isolation_verified', 'supervisor_policy_verified')):
@@ -229,18 +245,22 @@ class NetworkHook:
             self.mac('activate', target, epoch)
             return
         ns = ['ip', 'netns', 'exec', s['namespace']]
-        self.record(ns_chains=True, ns_sysctl=self.ns_sysctl_prior(ns), ns_routes=True,
-                    rules=True, table_routes=True, container_chain=True)
+        tailnet = s.get('transport') == 'tailnet'
+        resources = dict(ns_chains=True, ns_sysctl=self.ns_sysctl_prior(ns), ns_routes=True, rules=True, table_routes=True)
+        if not tailnet:
+            resources['container_chain'] = True
+        self.record(**resources)
         ns_rules = ['-i {tunnel} -o {namespace_veth} -d {mac_peer} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT'.format(**s)]
         ns_rules += ['-i {namespace_veth} -o {tunnel} -s {mac_peer} -d '.format(**s) + p + ' -j ACCEPT' for p in s['corporate_prefixes']]
         self.chain(ns, 'filter', 'FROG_CG_NS', 'FORWARD', ns_rules + ['-j REJECT'])
         for key, wanted in NS_SYSCTL:
             self.command(ns + ['sysctl', '-w', key + '=' + wanted])
-        routes, ours, _ = self.return_route()
-        if routes != ours or (routes and not self.owner()['resources'].get('return_route')):
-            raise RuntimeError('return_route_already_owned')
-        self.record(return_route=True)
-        self.command(['ip', 'route', 'replace', s['mac_peer'], 'via', s['container_address'], 'dev', s['host_bridge']])
+        if not tailnet:
+            routes, ours, _ = self.return_route()
+            if routes != ours or (routes and not self.owner()['resources'].get('return_route')):
+                raise RuntimeError('return_route_already_owned')
+            self.record(return_route=True)
+            self.command(['ip', 'route', 'replace', s['mac_peer'], 'via', s['container_address'], 'dev', s['host_bridge']])
         self.command(['ip', '-n', s['namespace'], 'route', 'replace', s['mac_peer'], 'via', s['host_link_address'], 'dev', s['namespace_veth']])
         for p in s['corporate_prefixes']:
             self.command(['ip', 'route', 'replace', 'unreachable', p, 'table', str(s['table']), 'metric', '32760'])
@@ -255,8 +275,9 @@ class NetworkHook:
                 attrs = dict(resources.get('rule_attrs', {}), **{p: self.rule_extras(created[0])})
                 self.record(rule_attrs=attrs)
             self.command(['ip', 'route', 'replace', p, 'via', s['namespace_link_address'], 'dev', s['host_veth'], 'table', str(s['table']), 'metric', '10'])
-        bypass = ['-s ' + s['mac_peer'] + ' -d ' + p + ' -j ACCEPT' for p in s['corporate_prefixes']]
-        self.chain(['docker', 'exec', '-i', s['container']], 'nat', 'FROG_CG_BYPASS', 'POSTROUTING', bypass)
+        if not tailnet:
+            bypass = ['-s ' + s['mac_peer'] + ' -d ' + p + ' -j ACCEPT' for p in s['corporate_prefixes']]
+            self.chain(['docker', 'exec', '-i', s['container']], 'nat', 'FROG_CG_BYPASS', 'POSTROUTING', bypass)
         snat = ['-s ' + s['mac_peer'] + ' -d ' + p + ' -o ' + s['tunnel'] + ' -j MASQUERADE' for p in s['corporate_prefixes']]
         self.chain(ns, 'nat', 'FROG_CG_SNAT', 'POSTROUTING', snat)
         mss = str(s['tcp_mss'])
@@ -290,6 +311,10 @@ class NetworkHook:
 
         if res.get('host_chain'):
             step('host_block', lambda: self.host_filter(False))  # Fail closed before dismantling.
+            # Re-blocking may update the owned table receipt. Keep that generation
+            # when later recovery steps persist resource removal.
+            owner = self.owner()
+            res = owner['resources']
         if res.get('mac'):
             def mac_recover():
                 kept.extend('mac_' + item for item in self.mac('recover', target, epoch).get('kept', []))

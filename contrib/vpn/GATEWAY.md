@@ -164,3 +164,21 @@ state retained, bounded budgets and installer rollback. The recovery tests run t
 real hook and helper entry points against simulated hosts; they are not a substitute
 for attended acceptance on the real client and gateway. Build/test the Rust command reflexes and compile the
 native helper without executing it. No live login is part of preparation.
+## Overlay ingress
+
+`transport: tailnet` selects a single CGNAT `/32` peer and verifies its configured
+stable node ID against the live overlay status. The host return route remains
+owned by the overlay. Docker NAT exemptions are not used in this mode.
+
+The owned nftables guard runs before the overlay's forwarding accepts. Its
+postrouting filter removes only the overlay NAT mark for the approved peer and
+corporate destinations, preserving source identity inside the VPN namespace.
+Shared overlay chains are never flushed or replaced. Recovery requires the
+recorded semantic digest of the owned nftables table.
+
+The Mac helper blocks corporate IPv4 and global/ULA IPv6 outside the selected
+tunnel. Operator-owned scoped DNS must remain present during authentication and
+network withdrawal. Native Mac mode is refused while this ingress configuration
+is selected; changing exit-node ownership needs separate operator coordination.
+Unit tests do not substitute for attended DNS, PF, MFA and real-device acceptance.
+
