@@ -21,6 +21,9 @@ pub(crate) fn action(text: &str) -> Option<&'static str> {
             ("vpn_setup", "") | ("vpn", "setup") => Some("setup"),
             ("vpn_connect", "") | ("vpn", "connect") => Some("connect"),
             ("vpn_reconnect", "") | ("vpn", "reconnect") => Some("reconnect"),
+            ("vpn_mode", "") | ("vpn", "mode") => Some("mode_status"),
+            ("vpn_vps", "") | ("vpn_mode", "vps") => Some("mode_vps"),
+            ("vpn_mac", "") | ("vpn_mode", "mac") => Some("mode_mac"),
             _ => None,
         };
     }
@@ -35,6 +38,8 @@ pub(crate) fn action(text: &str) -> Option<&'static str> {
         "статус vpn" | "статус впн" | "сколько осталось vpn" => {
             Some("status")
         }
+        "vpn на сервере" | "впн на сервере" => Some("mode_vps"),
+        "vpn на компьютере" | "впн на компьютере" => Some("mode_mac"),
         _ => None,
     }
 }
@@ -118,6 +123,10 @@ mod tests {
         assert_eq!(action("/vpn@assistant reconnect"), Some("reconnect"));
         assert_eq!(action("Статус VPN"), Some("status"));
         assert_eq!(action("/vpn_setup"), Some("setup"));
+        assert_eq!(action("/vpn_mode"), Some("mode_status"));
+        assert_eq!(action("/vpn_mode vps"), Some("mode_vps"));
+        assert_eq!(action("VPN на компьютере"), Some("mode_mac"));
+        assert_eq!(action("/vpn_vps arbitrary-host"), None);
         for text in [
             "он сказал переподключись",
             "переподключись и удали файлы",

@@ -67,6 +67,10 @@ chase a peer that disconnects when the other peer connects.
 
 ## Authentication and delivery
 
+The separate, disabled single-session gateway option is documented in
+[`GATEWAY.md`](GATEWAY.md). Preparing it does not enable the legacy simultaneous
+session gate. Its network renderer has no execution capability.
+
 Credentials are entered only through the one-time HTTPS page. Enrollment tokens
 are kept out of request paths and query strings; request logging must not include
 Authorization headers or bodies. Tokens expire after ten minutes and are consumed

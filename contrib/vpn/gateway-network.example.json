@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "mac_peer": "10.9.0.2/32",
+  "corporate_prefixes": [
+    "10.60.0.0/16"
+  ],
+  "protected_prefixes": [
+    "10.9.0.0/24",
+    "172.31.77.0/24",
+    "192.168.100.0/24"
+  ],
+  "vps_endpoint": "203.0.113.1",
+  "corporate_endpoint": "203.0.113.2",
+  "container_address": "198.51.100.3",
+  "host_link_address": "198.51.100.1",
+  "namespace_link_address": "198.51.100.2",
+  "container": "vpn_container",
+  "container_mac": "02:00:00:00:00:01",
+  "host_bridge": "br_vpn",
+  "host_veth": "veth_corp",
+  "namespace": "corp_vpn",
+  "namespace_veth": "eth_peer",
+  "tunnel": "tun0",
+  "ipv6_policy": "deny",
+  "table": 21000,
+  "rule_priority": 21000,
+  "tcp_mss": 1300,
+  "corporate_dns": "10.60.0.53",
+  "dns_zones": [
+    "internal.example"
+  ]
+}

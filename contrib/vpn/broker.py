@@ -13,6 +13,7 @@ import time
 import urllib.request
 
 from targets import Credentials, Targets
+from modes import Modes
 
 
 class Broker:
@@ -100,19 +101,35 @@ class Broker:
         # This field is supplied only by the deterministic host adapter.
         if str(request.get('actor')) != str(self.config['owner_id']):
             return {'ok': False, 'text': 'Управление VPN доступно только владельцу.'}
+        action = request.get('action')
+        modes = Modes(self.config, self.targets, self.credentials)
+        if action == 'mode_status':
+            return modes.status()
+        if action in ('mode_mac', 'mode_vps'):
+            if not modes.allowed():
+                return dict(modes.status(), ok=False, code='gateway_disabled')
+            return self.start_mode(request, action.removeprefix('mode_'))
         if self.config.get('maintenance') and request.get('action') != 'status':
             return {'ok': False, 'text': self.config.get('maintenance_message',
                     'Автоматическое управление VPN временно приостановлено для проверки устойчивости. Используй штатный клиент OpenVPN.')}
-        action = request.get('action')
         if action == 'status':
             result = self.status()
             if self.config.get('maintenance'):
                 result['text'] += '\nАвтоподключение временно заблокировано; доступна только проверка состояния.'
+            if self.config.get('gateway_option'):
+                result['text'] += '\n' + modes.status()['text']
             return result
         if action == 'setup':
             return self.setup()
         if action not in ('connect', 'reconnect'):
             return {'ok': False, 'text': 'Неизвестная команда VPN.'}
+        if self.config.get('gateway_option'):
+            if not modes.allowed():
+                return dict(modes.status(), ok=False, code='gateway_disabled')
+            live = self.targets.mode_snapshot()
+            connected = [h for h in ('mac', 'vps') if live[h].get('ok') and live[h].get('state') == 'connected']
+            target = connected[0] if len(connected) == 1 else modes.option().get('preferred_mode', 'vps')
+            return self.start_mode(request, target, action == 'reconnect')
         if not self.config.get('simultaneous_verified'):
             return {'ok': False, 'text': 'Одновременное подключение Mac и VPS ещё не проверено. Автоматический вход заблокирован до проверки устойчивости.'}
         hosts = request.get('targets', ['vps', 'mac'])
@@ -134,6 +151,21 @@ class Broker:
         threading.Thread(target=self.job, args=(ident, action, credentials, hosts), daemon=True).start()
         devices = 'VPS и Mac' if len(hosts)==2 else ('VPS' if hosts[0]=='vps' else 'Mac')
         return {'ok': True, 'text': f'Запускаю VPN на {devices}. Подтверди запросы в Multifactor; пришлю результат.'}
+
+    def start_mode(self, request, target, force=False):
+        if not self.lock.acquire(blocking=False):
+            return {'ok': False, 'text': 'Переключение VPN уже выполняется.'}
+
+        def work():
+            try:
+                result = Modes(self.config, self.targets, self.credentials).switch(
+                    target, request.get('request_id'), force)
+                self.notify(result['text'])
+            finally:
+                self.lock.release()
+
+        threading.Thread(target=work, daemon=True).start()
+        return {'ok': True, 'text': 'Начато переключение одной VPN-сессии. Подтверди MFA, когда появится запрос.'}
 
     def job(self, ident, action, credentials, hosts):
         result = {}

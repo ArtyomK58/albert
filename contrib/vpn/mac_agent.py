@@ -19,7 +19,7 @@ class Controller:
 
     def execute(self, request):
         action = request.get('action')
-        if action not in ('status', 'connect', 'reconnect'):
+        if action not in ('status', 'connect', 'reconnect', 'disconnect'):
             return {'ok': False, 'code': 'invalid_action'}
         if action != 'status' and self.config.get('maintenance'):
             return {'ok': False, 'code': 'maintenance'}
@@ -31,6 +31,13 @@ class Controller:
                 return {'ok': False, 'code': 'busy'}
         try:
             if action != 'status':
+                epoch = request.get('mode_epoch')
+                if epoch is None and self.config.get('mode_epoch_required'):
+                    return {'ok': False, 'code': 'mode_epoch_required'}
+                if epoch is not None:
+                    if type(epoch) is not int or epoch < 1 or epoch < int(self.results.get('_mode_epoch', 0)):
+                        return {'ok': False, 'code': 'stale_mode_epoch'}
+                    self.results['_mode_epoch'] = epoch
                 if ident in self.results:
                     return self.results[ident]
                 # Save before dispatch: unknown outcomes must never repeat MFA.
@@ -39,7 +46,7 @@ class Controller:
             payload = {'action': action, 'service_id': self.config['service_id']}
             payload['timeout_seconds'] = self.config.get('auth_timeout_seconds', 360)
             credentials = {key: request[key] for key in ('username', 'password') if key in request}
-            if action != 'status' and self.config.get('use_saved_credentials'):
+            if action in ('connect', 'reconnect') and self.config.get('use_saved_credentials'):
                 data = json.dumps(credentials, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
                 digest = hmac.new(self.config['token'].encode(), data, hashlib.sha256).hexdigest()
                 if not hmac.compare_digest(digest, self.config.get('credentials_digest', '')):
@@ -49,7 +56,7 @@ class Controller:
                     return result
             else:
                 payload.update(credentials)
-            if action != 'status' and self.config.get('client_app'):
+            if action in ('connect', 'reconnect') and self.config.get('client_app'):
                 subprocess.run(['/usr/bin/open', '-g', '-j', self.config['client_app']],
                                capture_output=True, timeout=15, check=True)
             process = subprocess.run([self.config['network_binary']], input=json.dumps(payload),

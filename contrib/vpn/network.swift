@@ -36,6 +36,17 @@ do {
     }
     if request.action == "status" {
         reply(["ok": true, "state": status()])
+    } else if request.action == "disconnect" {
+        let changed = status() != "disconnected"
+        if changed {
+            guard SCNetworkConnectionStop(connection, true) else {
+                throw NSError(domain: "stop_rejected", code: Int(SCError()))
+            }
+            let end = Date().addingTimeInterval(20)
+            while status() != "disconnected" && Date() < end { Thread.sleep(forTimeInterval: 0.2) }
+        }
+        guard status() == "disconnected" else { throw NSError(domain: "stop_timeout", code: 1) }
+        reply(["ok": true, "state": "disconnected", "changed": changed])
     } else if ["connect", "reconnect"].contains(request.action) {
         if request.action == "connect" && status() == "connected" {
             reply(["ok": true, "state": "connected", "changed": false])

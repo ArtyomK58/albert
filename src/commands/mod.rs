@@ -20,7 +20,10 @@ use crate::acl::BOOTSTRAP_COMMANDS;
 use tracing::{info, warn};
 
 /// Names no skill can claim.
-pub const RESERVED: [&str; 23] = [
+pub const RESERVED: [&str; 26] = [
+    "vpn_mode",
+    "vpn_vps",
+    "vpn_mac",
     "vpn",
     "vpn_status",
     "vpn_setup",
@@ -50,10 +53,17 @@ pub const RESERVED: [&str; 23] = [
 pub const SET_COMMANDS: &str = "chat.set_commands";
 
 /// System commands as they appear in `/help` and the menu: `(name, what it does, owner-only)`.
-const SYSTEM: [(&str, &str, bool); 20] = [
+const SYSTEM: [(&str, &str, bool); 23] = [
+    ("vpn_mode", "VPN mode and gateway readiness", true),
+    ("vpn_vps", "Move the single VPN session to the server", true),
+    (
+        "vpn_mac",
+        "Move the single VPN session to the computer",
+        true,
+    ),
     ("vpn", "VPN status", true),
-    ("vpn_connect", "Connect VPN on both devices", true),
-    ("vpn_reconnect", "Reauthenticate VPN on both devices", true),
+    ("vpn_connect", "Connect the configured VPN mode", true),
+    ("vpn_reconnect", "Reauthenticate the current VPN mode", true),
     ("vpn_setup", "One-time VPN credential setup", true),
     ("help", "Command reference", false),
     ("model", "Select a model", true),

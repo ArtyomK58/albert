@@ -18,12 +18,14 @@ class Targets:
     def __init__(self, config):
         self.config = config
 
-    def mac(self, action, credentials=None, request_id=None):
+    def mac(self, action, credentials=None, request_id=None, mode_epoch=None):
         body = {'action': action}
         if credentials:
             body.update(credentials)
         if request_id:
             body['request_id'] = request_id
+        if mode_epoch is not None:
+            body['mode_epoch'] = mode_epoch
         request = urllib.request.Request(
             self.config['mac_url'] + '/control', data=json.dumps(body).encode(),
             headers={'Authorization': 'Bearer ' + self.config['mac_token'],
@@ -41,6 +43,37 @@ class Targets:
             return {'ok': True, 'state': 'connected' if up else 'disconnected'}
         except (OSError, subprocess.TimeoutExpired):
             return {'ok': False, 'state': 'unknown', 'code': 'vps_unavailable'}
+
+    def mode_snapshot(self):
+        return {'vps': self.vps_status(), 'mac': self.mac('status')}
+
+    def mode_stop(self, host, ident, epoch):
+        if host == 'mac':
+            return self.mac('disconnect', request_id=ident + ':stop', mode_epoch=epoch)
+        result = command([self.config['vps_command'], 'stop'])
+        return {'ok': result.returncode == 0, 'state': self.vps_status().get('state', 'unknown')}
+
+    def mode_start(self, host, credentials, ident, epoch):
+        if host == 'mac':
+            return self.mac('connect', credentials, ident + ':start', epoch)
+        return self.vps_login(credentials, False)
+
+    def mode_hook(self, phase, target):
+        args = self.config.get('gateway_option', {}).get('network_hook', [])
+        if (phase not in ('preflight', 'block', 'activate', 'verify') or target not in ('mac', 'vps')
+                or not isinstance(args, list) or not args or not all(isinstance(x, str) for x in args)
+                or not Path(args[0]).is_absolute()):
+            return {'ok': False, 'code': 'network_hook_unconfigured'}
+        try:
+            stat = Path(args[0]).stat()
+            if stat.st_uid != 0 or stat.st_mode & 0o022:
+                return {'ok': False, 'code': 'network_hook_not_operator_owned'}
+            result = subprocess.run(args, input=json.dumps({'phase': phase, 'target': target}),
+                                    capture_output=True, text=True, timeout=25)
+            value = json.loads(result.stdout)
+            return {'ok': result.returncode == 0 and value.get('ok') is True}
+        except Exception:
+            return {'ok': False, 'code': 'network_hook_unavailable'}
 
     def vps_login(self, credentials, force, on_pending=None):
         if not force and self.vps_status().get('state') == 'connected':
