@@ -4,6 +4,7 @@ import hmac
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import re
 from pathlib import Path
 import subprocess
@@ -16,6 +17,14 @@ class Controller:
         self.lock = threading.Lock()
         self.cache_path = Path(config['state_file'])
         self.results = json.loads(self.cache_path.read_text()) if self.cache_path.exists() else {}
+        # The fencing high-water mark lives outside the bounded result cache, so cache
+        # eviction or a restart can never lower it. Older files kept it in the cache.
+        self.epoch_path = self.cache_path.with_suffix('.epoch')
+        stored = int(self.epoch_path.read_text()) if self.epoch_path.exists() else 0
+        legacy = self.results.pop('_mode_epoch', 0)
+        self.mode_epoch = max(stored, int(legacy) if type(legacy) is int else 0)
+        if self.mode_epoch > stored:
+            self.persist_epoch()
 
     def execute(self, request):
         action = request.get('action')
@@ -35,9 +44,11 @@ class Controller:
                 if epoch is None and self.config.get('mode_epoch_required'):
                     return {'ok': False, 'code': 'mode_epoch_required'}
                 if epoch is not None:
-                    if type(epoch) is not int or epoch < 1 or epoch < int(self.results.get('_mode_epoch', 0)):
+                    if type(epoch) is not int or epoch < 1 or epoch < self.mode_epoch:
                         return {'ok': False, 'code': 'stale_mode_epoch'}
-                    self.results['_mode_epoch'] = epoch
+                    if epoch > self.mode_epoch:
+                        self.mode_epoch = epoch
+                        self.persist_epoch()  # Durable before any dispatch.
                 if ident in self.results:
                     return self.results[ident]
                 # Save before dispatch: unknown outcomes must never repeat MFA.
@@ -87,6 +98,16 @@ class Controller:
         finally:
             if action != 'status':
                 self.lock.release()
+
+    def persist_epoch(self):
+        self.epoch_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.epoch_path.with_name(self.epoch_path.name + '.new')
+        with tmp.open('w') as f:
+            f.write(str(self.mode_epoch))
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.chmod(0o600)
+        tmp.replace(self.epoch_path)
 
     def persist(self):
         self.results = dict(list(self.results.items())[-128:])
