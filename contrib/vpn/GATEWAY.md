@@ -33,8 +33,8 @@ The staged Mac config additionally sets `mode_epoch_required: true`. This is not
 applied to an existing client until the operator deploys this version.
 
 `/vpn_mode` reports readiness; `/vpn_vps`, `/vpn_mac` and exact mode aliases select
-one session. Disabled requests return before credentials, target calls or state
-files are touched. In single-session mode legacy connect/reconnect commands cannot
+one session; `/vpn_recover` withdraws the gateway's own network changes (see below).
+Disabled requests return before credentials, target calls or state files are touched. In single-session mode legacy connect/reconnect commands cannot
 enter the dual-session path. Commands remain authenticated owner/private-chat
 reflexes outside the LLM.
 
@@ -42,7 +42,8 @@ reflexes outside the LLM.
 deduplication, confirms the old session is down before starting the new one, waits
 at least a minute for retained transport, then runs network acceptance. Interrupted
 or uncertain switches require operator reconciliation. There is no automatic MFA
-retry or login rollback. Mac rejects stale epochs before invoking its native helper.
+retry or login rollback. Mac rejects stale epochs before invoking its native helper; its high-water mark is
+stored separately from the bounded result cache and survives restarts.
 
 ## Network preparation and activation boundary
 
@@ -65,8 +66,10 @@ The future hook accepts one JSON object on stdin with `phase` and `target`:
 `preflight` checks control-channel reachability, current topology, peer isolation,
 route ownership and supervisor reconnect policy; `block` is an idempotent
 fail-closed withdrawal; `activate` installs exactly the reviewed target's routing
-and DNS; `verify` checks real service/DNS access and leakage. It must return bounded
-JSON with `ok`. The executable must be root-owned and not group/world writable.
+and DNS; `verify` checks that the corporate routes use the expected interface and
+that one probe service resolves into a corporate prefix and accepts TCP. `verify`
+does not prove the absence of DNS or IPv6 leaks; those remain separate attended
+acceptance tests. `recover` is described below. It must return bounded JSON with `ok`. The executable must be root-owned and not group/world writable.
 The host backend updates only dedicated firewall chains with atomic restore,
 retains unreachable fallback routes, verifies container identity and owns a
 manifest signature. It exposes the peer only after the namespace and Mac are ready.
@@ -83,6 +86,52 @@ Its launcher accepts only the enumerated phase/target and an integer epoch, neve
 an alternate configuration path or a shell command. Preparing this installer does
 not authorize running it or requesting an administrator prompt.
 
+## Recovery (owned off-ramp)
+
+A failed or uncertain switch freezes new logins and can leave the fail-closed block
+in place, including on the client's native corporate VPN. `/vpn_recover` (owner,
+private chat) or, as root on the gateway host, `modes.py --config <broker-config>
+--recover` withdraws only the gateway's own network changes:
+
+- it never authenticates, starts MFA, stops or starts a VPN session, or enables
+  the gateway; afterwards the next login needs a new explicit command;
+- it works while the option is disabled or under maintenance, but only when a
+  switch state file exists; otherwise it returns `nothing_to_recover` without
+  creating files or running the hook;
+- it takes a new epoch first, so a delayed apply from an older switch is rejected;
+- the host withdraws the peer first, then removes the recorded container NAT
+  exemption, exact policy rules, exact table routes, the owned `/32` return route
+  and namespace chains/routes, and removes its own firewall chain last. Global
+  forwarding, Docker's shared chains, default routes and foreign entries with the
+  same priority or table are retained;
+- the client removes only recorded routes that still point at the recorded
+  interface, resolver files whose content is unchanged, the rules and tables of
+  its own PF anchor (refusing if the anchor holds foreign rules), and releases its
+  own PF enable reference. It never disables PF or edits `pf.conf`;
+- each resource is recorded before creation; withdrawal uses the recorded
+  generation, not the current configuration. A foreign change is kept and reported.
+
+If the client is unreachable, the host keeps the peer blocked and reports
+`recovery_incomplete`; logins stay frozen and recovery can be repeated. When the
+gateway host itself is unavailable, the client operator can run the installed
+launcher with `--phase recover --target mac --epoch <current mode epoch>`.
+These withdrawal semantics are verified only on simulated hosts; PF anchor flush
+and reference release must be confirmed during attended client acceptance.
+
+## Bounded waits
+
+Every layer has an absolute budget and starts a step only when that step's full
+timeout plus a fail-safe reserve still fits, so an outer layer never kills an
+inner step that is still within its allowance. Budgets are fixed in
+`gateway_plan.py`: client OS command < client helper phase < relay exec limit <
+relay call including endpoint probes < host hook phase < broker wait for the hook.
+The relay command in the private hook configuration must use the exact relay exec
+limit; otherwise the hook refuses before dispatching. Lock waits are bounded. An
+expired budget is reported as a failure after re-blocking; nothing is retried
+automatically and no MFA is repeated.
+
+## Acceptance
+
 Activation still requires a controlled MFA cycle, split-DNS/fallback/IPv6 tests,
 another-peer denial, namespace recreation, route collision checks and a latency
 comparison. Any private supervisor code that can restore global forwarding to zero
@@ -91,7 +140,11 @@ personal VPN container's lifecycle or reconnect policy merely to prepare this op
 
 ## Tests
 
-Run the existing Python suite plus `test_gateway.py`. Synthetic tests cover disabled
-side-effect freedom, route rejection, stop-confirm-start order, uncertain-outcome
-freeze and stale Mac epochs. Build/test the Rust command reflexes and compile the
+Run the existing Python suite plus `test_gateway.py`, `test_gateway_network.py` and
+`test_gateway_recovery.py`. Synthetic tests cover disabled side-effect freedom, route
+rejection, stop-confirm-start order, uncertain-outcome freeze, stale epochs across
+cache eviction and restart, recovery after failure/timeout/disablement with foreign
+state retained, bounded budgets and installer rollback. The recovery tests run the
+real hook and helper entry points against simulated hosts; they are not a substitute
+for attended acceptance on the real client and gateway. Build/test the Rust command reflexes and compile the
 native helper without executing it. No live login is part of preparation.

@@ -67,7 +67,8 @@ chase a peer that disconnects when the other peer connects.
 
 ## Authentication and delivery
 
-The separate, disabled single-session gateway option is documented in
+The separate, disabled single-session gateway option and its `/vpn_mode`,
+`/vpn_vps`, `/vpn_mac` and `/vpn_recover` commands are documented in
 [`GATEWAY.md`](GATEWAY.md). Preparing it does not enable the legacy simultaneous
 session gate. Its network renderer has no execution capability.
 

@@ -1,12 +1,63 @@
 """Validate and render an inert gateway plan. This module never runs commands."""
 import argparse
+import fcntl
 import ipaddress
 import json
 from pathlib import Path
 import re
+import time
 
 
 PRIVATE = tuple(ipaddress.ip_network(s) for s in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
+
+# Timeout hierarchy, innermost first. Each layer starts work only when its whole
+# per-step timeout plus a fail-safe reserve still fits, so an outer layer never
+# kills an inner step that is still within its own allowed budget.
+MAC_COMMAND_TIMEOUT = 8                       # one OS command inside the Mac helper
+MAC_FAILSAFE_RESERVE = 3 * MAC_COMMAND_TIMEOUT  # re-blocking after a failed phase
+MAC_LOCK_WAIT = 10
+MAC_HELPER_BUDGET = 90                        # absolute wall time of one helper phase
+MAC_LINK_EXEC_TIMEOUT = MAC_HELPER_BUDGET + 10  # relay exec limit; covers sudo/interpreter start
+MAC_LINK_OVERHEAD = 5 + 2 * 4 + 7             # relay HTTP slack, two endpoint probes, process start
+MAC_CALL_TIMEOUT = MAC_LINK_EXEC_TIMEOUT + MAC_LINK_OVERHEAD
+HOST_COMMAND_TIMEOUT = 8
+HOST_FAILSAFE_RESERVE = 3 * HOST_COMMAND_TIMEOUT
+HOOK_LOCK_WAIT = 10
+HOOK_BUDGET = MAC_CALL_TIMEOUT + HOST_FAILSAFE_RESERVE + 90
+HOOK_PROCESS_TIMEOUT = HOOK_BUDGET + 15       # broker -> hook process, includes interpreter start
+
+
+class DeadlineExceeded(RuntimeError):
+    pass
+
+
+class Deadline:
+    """Absolute budget. A step starts only if its full timeout and the reserve still fit."""
+
+    def __init__(self, seconds, clock):
+        self.clock = clock
+        self.end = clock() + seconds
+
+    def remaining(self):
+        return self.end - self.clock()
+
+    def admit(self, step_timeout, reserve):
+        if self.remaining() < step_timeout + reserve:
+            raise DeadlineExceeded('deadline_exceeded_before_step')
+        return step_timeout
+
+
+def acquire(lock, seconds, clock=time.monotonic, sleep=time.sleep):
+    """Bounded exclusive file lock; an orphaned holder cannot block a phase forever."""
+    end = clock() + seconds
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if clock() >= end:
+                return False
+            sleep(0.1)
 
 
 def network(value):
@@ -127,7 +178,7 @@ def render(c):
                             '--mss', str(c['tcp_mss'] + 1) + ':65535', '-j', 'TCPMSS', '--set-mss', mss])
     return {'schema': 1, 'state': 'staged', 'applied': False, 'operations': operations,
             'operation_order': 'Render order is significant; guards precede routing exposure and per-prefix allows precede rejects.',
-            'mac': {'interface_selection': 'find the configured Amnezia source address; never pin an utun number',
+            'mac': {'interface_selection': 'find the configured personal VPN source address; never pin an utun number',
                     'route_prefixes': [str(p) for p in prefixes],
                     'resolver_files': {zone: 'nameserver ' + c['corporate_dns'] + '\n' for zone in c['dns_zones']},
                     'live_files_written': False},

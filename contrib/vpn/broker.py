@@ -109,6 +109,12 @@ class Broker:
             if not modes.allowed():
                 return dict(modes.status(), ok=False, code='gateway_disabled')
             return self.start_mode(request, action.removeprefix('mode_'))
+        if action == 'mode_recover':
+            # Allowed during maintenance and when disabled: it only withdraws recorded own
+            # network changes, never authenticates, and is a no-op without switch state.
+            if not modes.recoverable():
+                return modes.recover(request.get('request_id'))
+            return self.start_recover(request)
         if self.config.get('maintenance') and request.get('action') != 'status':
             return {'ok': False, 'text': self.config.get('maintenance_message',
                     'Автоматическое управление VPN временно приостановлено для проверки устойчивости. Используй штатный клиент OpenVPN.')}
@@ -166,6 +172,20 @@ class Broker:
 
         threading.Thread(target=work, daemon=True).start()
         return {'ok': True, 'text': 'Начато переключение одной VPN-сессии. Подтверди MFA, когда появится запрос.'}
+
+    def start_recover(self, request):
+        if not self.lock.acquire(blocking=False):
+            return {'ok': False, 'text': 'Переключение VPN ещё выполняется; восстановление не начато.'}
+
+        def work():
+            try:
+                result = Modes(self.config, self.targets, None).recover(request.get('request_id'))
+                self.notify(result['text'])
+            finally:
+                self.lock.release()
+
+        threading.Thread(target=work, daemon=True).start()
+        return {'ok': True, 'text': 'Снимаю сетевые изменения шлюза. Вход и MFA не запускаются; пришлю результат.'}
 
     def job(self, ident, action, credentials, hosts):
         result = {}

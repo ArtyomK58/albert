@@ -9,6 +9,8 @@ import subprocess
 import time
 import urllib.request
 
+from gateway_plan import HOOK_PROCESS_TIMEOUT
+
 
 def command(args, timeout=25):
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
@@ -60,7 +62,7 @@ class Targets:
 
     def mode_hook(self, phase, target):
         args = self.config.get('gateway_option', {}).get('network_hook', [])
-        if (phase not in ('preflight', 'block', 'activate', 'verify') or target not in ('mac', 'vps')
+        if (phase not in ('preflight', 'block', 'activate', 'verify', 'recover') or target not in ('mac', 'vps')
                 or not isinstance(args, list) or not args or not all(isinstance(x, str) for x in args)
                 or not Path(args[0]).is_absolute()):
             return {'ok': False, 'code': 'network_hook_unconfigured'}
@@ -68,10 +70,16 @@ class Targets:
             stat = Path(args[0]).stat()
             if stat.st_uid != 0 or stat.st_mode & 0o022:
                 return {'ok': False, 'code': 'network_hook_not_operator_owned'}
-            result = subprocess.run(args, input=json.dumps({'phase': phase, 'target': target}),
-                                    capture_output=True, text=True, timeout=25)
+            # Longer than the hook's own absolute budget: a phase that is still within
+            # its budget is never killed here.
+            result = subprocess.run(args, input=json.dumps({'phase': phase, 'target': target}) + '\n',
+                                    capture_output=True, text=True, timeout=HOOK_PROCESS_TIMEOUT)
             value = json.loads(result.stdout)
-            return {'ok': result.returncode == 0 and value.get('ok') is True}
+            kept = value.get('kept') if isinstance(value.get('kept'), list) else []
+            return {'ok': result.returncode == 0 and value.get('ok') is True,
+                    'code': str(value.get('code', ''))[:64], 'kept': [str(x)[:64] for x in kept[:32]]}
+        except subprocess.TimeoutExpired:
+            return {'ok': False, 'code': 'network_hook_timeout'}
         except Exception:
             return {'ok': False, 'code': 'network_hook_unavailable'}
 

@@ -42,8 +42,11 @@ class NetworkTests(unittest.TestCase):
         def run(args, **kwargs):
             events.append(('command', args, kwargs.get('input')))
             return subprocess.CompletedProcess(args, 0, '', '')
-        obj = NetworkHook({'enabled': True, 'prepare_only': False, 'network': fixture()}, run)
-        obj.host_filter = lambda active: events.append(('host_access', active))
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        obj = NetworkHook({'enabled': True, 'prepare_only': False, 'network': fixture(),
+                           'resource_state': str(Path(d.name) / 'owner.json')}, run)
+        obj.host_filter = lambda active, reserve=None: events.append(('host_access', active))
         obj.mac = lambda *args: events.append(('mac', args))
         self.assertTrue(obj.execute('activate', 'vps', 1)['ok'])
         self.assertEqual(events[0], ('host_access', False))
@@ -54,7 +57,10 @@ class NetworkTests(unittest.TestCase):
 
     def test_failed_activation_withdraws_host_access_without_retry(self):
         run = Mock(side_effect=RuntimeError('synthetic failure'))
-        obj = NetworkHook({'enabled': True, 'prepare_only': False, 'network': fixture()}, run)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        obj = NetworkHook({'enabled': True, 'prepare_only': False, 'network': fixture(),
+                           'resource_state': str(Path(d.name) / 'owner.json')}, run)
         obj.host_filter = Mock()
         obj.mac = Mock()
         self.assertFalse(obj.execute('activate', 'vps', 1)['ok'])
@@ -63,10 +69,12 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(obj.mac.call_count, 0)
 
     def test_blocking_peer_preserves_namespace_vpn_transport_replies(self):
-        obj = NetworkHook({'network': fixture()})
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        obj = NetworkHook({'network': fixture(), 'resource_state': str(Path(d.name) / 'owner.json')})
         obj.chain = Mock()
         obj.host_filter(False)
-        rules = obj.chain.call_args.args[-1]
+        rules = obj.chain.call_args.args[4]
         self.assertIn(fixture()['namespace_link_address'] + '/32', rules[0])
         self.assertIn('ESTABLISHED,RELATED -j ACCEPT', rules[0])
         self.assertEqual(rules[-1], '-o ' + fixture()['host_veth'] + ' -j REJECT')
@@ -81,8 +89,11 @@ class NetworkTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, text, '')
             state = Path(d) / 'state.json'
             obj = MacNetwork({'network': fixture(), 'allow_pf_enable': True, 'state_file': str(state)}, run)
-            obj.guard()
-            self.assertEqual(state.with_suffix('.pf-token').read_text(), '12345')
+            value = {'epoch': 1, 'routes': {}, 'resolvers': {}}
+            obj.guard(value, state)
+            saved = json.loads(state.read_text())
+            self.assertEqual(saved['pf_token'], '12345')
+            self.assertTrue(saved['anchor_owned'])
 
 
 if __name__ == '__main__':

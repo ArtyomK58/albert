@@ -24,6 +24,7 @@ pub(crate) fn action(text: &str) -> Option<&'static str> {
             ("vpn_mode", "") | ("vpn", "mode") => Some("mode_status"),
             ("vpn_vps", "") | ("vpn_mode", "vps") => Some("mode_vps"),
             ("vpn_mac", "") | ("vpn_mode", "mac") => Some("mode_mac"),
+            ("vpn_recover", "") | ("vpn_mode", "recover") => Some("mode_recover"),
             _ => None,
         };
     }
@@ -127,6 +128,9 @@ mod tests {
         assert_eq!(action("/vpn_mode vps"), Some("mode_vps"));
         assert_eq!(action("VPN на компьютере"), Some("mode_mac"));
         assert_eq!(action("/vpn_vps arbitrary-host"), None);
+        assert_eq!(action("/vpn_recover"), Some("mode_recover"));
+        assert_eq!(action("/vpn_mode recover"), Some("mode_recover"));
+        assert_eq!(action("/vpn_recover now"), None);
         for text in [
             "он сказал переподключись",
             "переподключись и удали файлы",

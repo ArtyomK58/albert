@@ -9,18 +9,45 @@ from pathlib import Path
 import re
 import socket
 import subprocess
+import threading
+import time
 
-from gateway_plan import validate
+from gateway_plan import (Deadline, MAC_COMMAND_TIMEOUT, MAC_FAILSAFE_RESERVE, MAC_HELPER_BUDGET,
+                          MAC_LOCK_WAIT, acquire, validate)
+
+ANCHOR = 'com.apple/frog-corp'
+PHASES = ('preflight', 'block', 'activate', 'verify', 'recover')
+
+
+def bounded_resolve(host, timeout):
+    box = {}
+
+    def work():
+        try:
+            box['address'] = socket.gethostbyname(host)
+        except OSError:
+            pass
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if 'address' not in box:
+        raise RuntimeError('probe_resolution_failed')
+    return box['address']
 
 
 class MacNetwork:
-    def __init__(self, config, run=subprocess.run):
+    def __init__(self, config, run=None, clock=time.monotonic, deadline=None,
+                 resolve=bounded_resolve, connect=socket.create_connection):
         self.c = config
         self.s = config.get('network', {})
-        self.run = run
+        self.run = run or subprocess.run
+        self.deadline = deadline or Deadline(MAC_HELPER_BUDGET, clock)
+        self.resolve = resolve
+        self.connect = connect
 
-    def command(self, args, data=None, check=True):
-        r = self.run(args, input=data, capture_output=True, text=True, timeout=20)
+    def command(self, args, data=None, check=True, reserve=MAC_FAILSAFE_RESERVE):
+        timeout = self.deadline.admit(MAC_COMMAND_TIMEOUT, reserve)
+        r = self.run(args, input=data, capture_output=True, text=True, timeout=timeout)
         if check and r.returncode:
             raise RuntimeError('mac_network_command_failed')
         return r
@@ -37,52 +64,79 @@ class MacNetwork:
                 return current
         raise RuntimeError('personal_vpn_source_absent')
 
-    def route_interface(self, prefix):
+    def route_fields(self, prefix):
         r = self.command(['/sbin/route', '-n', 'get', '-net', prefix], check=False)
-        match = re.search(r'(?m)^\s*interface:\s*(utun[0-9]+)\s*$', r.stdout)
-        return match.group(1) if match else None
+        return dict(re.findall(r'(?m)^\s*(destination|mask|interface):\s*(\S+)\s*$', r.stdout))
 
-    def guard(self, interface=None):
+    def route_interface(self, prefix):
+        # Best route actually used for the destination.
+        name = self.route_fields(prefix).get('interface', '')
+        return name if re.fullmatch(r'utun[0-9]+', name) else None
+
+    def exact_route(self, prefix):
+        # Only a route for exactly this prefix, never a covering default or wider route.
+        net = ipaddress.ip_network(prefix)
+        f = self.route_fields(prefix)
+        if f.get('destination') != str(net.network_address):
+            return None
+        if f.get('mask', str(ipaddress.ip_network('0.0.0.0/32').netmask)) != str(net.netmask):
+            return None
+        return f.get('interface')
+
+    def anchor_is_ours(self):
+        rules = self.command(['/sbin/pfctl', '-a', ANCHOR, '-sr']).stdout
+        return all('<frog_corp>' in line for line in rules.splitlines() if line.strip())
+
+    def guard(self, state, path, interface=None, reserve=MAC_FAILSAFE_RESERVE):
         # The stock Apple wildcard anchor must already be loaded; never replace pf.conf.
         prefixes = ', '.join(self.s['corporate_prefixes'])
         qualifier = ('on ! ' + interface + ' ') if interface else ''
         body = 'table <frog_corp> const { ' + prefixes + ' }\n'
         body += 'block drop out quick ' + qualifier + 'inet to <frog_corp>\n'
-        self.command(['/sbin/pfctl', '-a', 'com.apple/frog-corp', '-f', '-'], body)
-        info = self.command(['/sbin/pfctl', '-s', 'info']).stdout
+        if not state.get('anchor_owned'):
+            state['anchor_owned'] = True
+            self.save(path, state)  # Ownership is recorded before the anchor exists.
+        self.command(['/sbin/pfctl', '-a', ANCHOR, '-f', '-'], body, reserve=reserve)
+        info = self.command(['/sbin/pfctl', '-s', 'info'], reserve=reserve).stdout
         if 'Status: Enabled' not in info:
             if not self.c.get('allow_pf_enable'):
                 raise RuntimeError('pf_enable_requires_operator_acceptance')
-            # Keep PF enabled throughout mode changes; do not disable another owner's PF.
-            enabled = self.command(['/sbin/pfctl', '-E'])
+            # Keep PF enabled throughout mode changes; recovery releases only this reference.
+            enabled = self.command(['/sbin/pfctl', '-E'], reserve=reserve)
             token = re.search(r'Token\s*:\s*([0-9]+)', enabled.stdout + enabled.stderr)
             if not token:
                 raise RuntimeError('pf_reference_receipt_missing')
-            reference = Path(self.c['state_file']).with_suffix('.pf-token')
-            reference.write_text(token.group(1))
-            reference.chmod(0o600)
+            state['pf_token'] = token.group(1)
+            self.save(path, state)
         for prefix in self.s['corporate_prefixes']:
-            self.command(['/sbin/pfctl', '-k', '0.0.0.0/0', '-k', prefix])
+            self.command(['/sbin/pfctl', '-k', '0.0.0.0/0', '-k', prefix], reserve=reserve)
 
-    def withdraw(self, state):
-        # Never overwrite or delete a file modified by somebody else.
-        for zone, content in state.get('resolvers', {}).items():
+    def withdraw(self, state, path, kept=None):
+        # Never overwrite or delete a file or route modified by somebody else.
+        for zone, content in list(state.get('resolvers', {}).items()):
             p = Path(self.c['resolver_dir']) / zone
             if p.exists():
                 if p.read_text() != content:
-                    raise RuntimeError('resolver_changed_by_another_owner')
-                p.unlink()
-        state['resolvers'] = {}
-        for prefix, interface in state.get('routes', {}).items():
-            if self.route_interface(prefix) == interface:
+                    if kept is None:
+                        raise RuntimeError('resolver_changed_by_another_owner')
+                    kept.append('resolver')
+                else:
+                    p.unlink()
+            del state['resolvers'][zone]
+            self.save(path, state)
+        for prefix, interface in list(state.get('routes', {}).items()):
+            if self.exact_route(prefix) == interface:
                 self.command(['/sbin/route', '-n', 'delete', '-net', prefix, '-interface', interface])
-        state['routes'] = {}
+            del state['routes'][prefix]
+            self.save(path, state)
 
-    def preflight(self, target):
+    def preflight(self, target, state):
         if not all(self.c.get(k) is True for k in ('pf_policy_verified', 'dns_fail_closed_verified', 'ipv6_policy_verified')):
             raise RuntimeError('mac_operator_acceptance_missing')
         if 'anchor "com.apple/*"' not in self.command(['/sbin/pfctl', '-sr']).stdout:
             raise RuntimeError('expected_pf_anchor_missing')
+        if not state.get('anchor_owned') and not self.anchor_is_ours():
+            raise RuntimeError('pf_anchor_used_by_another_owner')
         if target == 'vps':
             self.vpn_interface()
         for zone in self.s['dns_zones']:
@@ -90,19 +144,57 @@ class MacNetwork:
             if p.exists() and p.read_text() != 'nameserver ' + self.s['corporate_dns'] + '\n':
                 raise RuntimeError('existing_resolver_requires_review')
 
+    def recover(self, state, path, epoch):
+        # Owned withdrawal only: no login, no session stop, no pf.conf or global PF change.
+        kept = []
+        state.update(epoch=epoch, phase='recovering')
+        self.save(path, state)
+        self.withdraw(state, path, kept)
+        if state.get('anchor_owned'):
+            if not self.anchor_is_ours():
+                raise RuntimeError('pf_anchor_contains_foreign_rules')
+            self.command(['/sbin/pfctl', '-a', ANCHOR, '-F', 'rules'])
+            self.command(['/sbin/pfctl', '-a', ANCHOR, '-F', 'Tables'])
+            state['anchor_owned'] = False
+            self.save(path, state)
+        legacy = path.with_suffix('.pf-token')
+        token = state.get('pf_token') or (legacy.read_text().strip() if legacy.exists() else None)
+        if token:
+            # Releases only this helper's enable reference; another owner's PF stays enabled.
+            self.command(['/sbin/pfctl', '-X', token])
+            state['pf_token'] = None
+            self.save(path, state)
+            legacy.unlink(missing_ok=True)
+        state.update(phase='recovered', mode=None, active_interface=None)
+        self.save(path, state)
+        return {'ok': True, 'code': 'recovered', 'kept': kept}
+
     def execute(self, phase, target, epoch):
-        if self.c.get('enabled') is not True or self.c.get('prepare_only') is not False:
-            return {'ok': False, 'code': 'gateway_disabled'}
-        if phase not in ('preflight', 'block', 'activate', 'verify') or target not in ('mac', 'vps') or type(epoch) is not int or epoch < 0:
+        if phase not in PHASES or target not in ('mac', 'vps') or type(epoch) is not int or epoch < 0:
             return {'ok': False, 'code': 'invalid_request'}
-        validate(self.s)
+        if phase != 'recover' and (self.c.get('enabled') is not True or self.c.get('prepare_only') is not False):
+            return {'ok': False, 'code': 'gateway_disabled'}
         path = Path(self.c['state_file'])
+        if phase == 'recover':
+            # Narrow exception to the disabled gate: it can only remove recorded own resources.
+            if not path.exists():
+                return {'ok': True, 'code': 'nothing_owned', 'kept': []}
+            state = json.loads(path.read_text())
+            if epoch < state['epoch']:
+                return {'ok': False, 'code': 'stale_mode_epoch'}
+            try:
+                return self.recover(state, path, epoch)
+            except Exception:
+                state['phase'] = 'recovery_incomplete'
+                self.save(path, state)
+                return {'ok': False, 'code': 'mac_recovery_incomplete'}
+        validate(self.s)
         state = json.loads(path.read_text()) if path.exists() else {'epoch': 0, 'routes': {}, 'resolvers': {}}
         if epoch < state['epoch']:
             return {'ok': False, 'code': 'stale_mode_epoch'}
         try:
             if phase == 'preflight':
-                self.preflight(target)
+                self.preflight(target, state)
                 return {'ok': True}
             if phase == 'verify':
                 if state.get('mode') != target or state.get('phase') != 'ready':
@@ -110,25 +202,31 @@ class MacNetwork:
                 expected = state.get('active_interface')
                 if not expected or any(self.route_interface(p) != expected for p in self.s['corporate_prefixes']):
                     raise RuntimeError('route_verification_failed')
-                # DNS/IPv6 leak acceptance is a separate attended gate, never inferred from this TCP check.
-                address = socket.gethostbyname(self.c['probe_host'])
+                # Route plus TCP reachability only. DNS-leak and IPv6-leak acceptance are
+                # separate attended tests and are never inferred from this probe.
+                self.deadline.admit(10, MAC_FAILSAFE_RESERVE)
+                address = self.resolve(self.c['probe_host'], 5)
                 if not any(ipaddress.ip_address(address) in ipaddress.ip_network(p) for p in self.s['corporate_prefixes']):
                     raise RuntimeError('probe_not_on_corporate_route')
-                with socket.create_connection((address, self.c.get('probe_port', 443)), timeout=5):
+                with self.connect((address, self.c.get('probe_port', 443)), timeout=5):
                     pass
                 return {'ok': True}
             state.update(epoch=epoch, phase='applying')
+            state.setdefault('routes', {})
+            state.setdefault('resolvers', {})
             self.save(path, state)  # Lost replies cannot erase ownership/fencing.
-            self.guard()
-            self.withdraw(state)
+            self.guard(state, path)
+            self.withdraw(state, path)
             if phase == 'block':
                 state['phase'] = 'blocked'
             elif target == 'vps':
                 interface = self.vpn_interface()
                 for prefix in self.s['corporate_prefixes']:
-                    self.command(['/sbin/route', '-n', 'add', '-net', prefix, '-interface', interface])
+                    if self.exact_route(prefix) is not None:
+                        raise RuntimeError('route_already_present_requires_review')
                     state['routes'][prefix] = interface
-                    self.save(path, state)
+                    self.save(path, state)  # Recorded before creation; removal re-checks it.
+                    self.command(['/sbin/route', '-n', 'add', '-net', prefix, '-interface', interface])
                 directory = Path(self.c['resolver_dir'])
                 directory.mkdir(exist_ok=True)
                 for zone in self.s['dns_zones']:
@@ -138,11 +236,11 @@ class MacNetwork:
                         if p.read_text() != content:
                             raise RuntimeError('resolver_requires_review')
                     else:
-                        p.write_text(content)
-                        p.chmod(0o644)
                         state['resolvers'][zone] = content
                         self.save(path, state)
-                self.guard(interface)
+                        p.write_text(content)
+                        p.chmod(0o644)
+                self.guard(state, path, interface)
                 state.update(mode=target, phase='ready', active_interface=interface)
             else:
                 interface = self.route_interface(self.s['corporate_dns'])
@@ -152,7 +250,7 @@ class MacNetwork:
                     personal = None
                 if not interface or interface == personal:
                     raise RuntimeError('native_corporate_route_missing')
-                self.guard(interface)
+                self.guard(state, path, interface)
                 state.update(mode=target, phase='ready', active_interface=interface)
             self.save(path, state)
             return {'ok': True}
@@ -160,7 +258,7 @@ class MacNetwork:
             if phase == 'preflight':
                 return {'ok': False, 'code': 'mac_network_preflight_failed'}
             try:
-                self.guard()
+                self.guard(state, path, reserve=0)  # Uses the reserved budget.
             except Exception:
                 pass
             state.update(epoch=epoch, phase='outcome_unknown')
@@ -177,6 +275,7 @@ class MacNetwork:
 
 
 def main():
+    deadline = Deadline(MAC_HELPER_BUDGET, time.monotonic)
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config', required=True)
     p.add_argument('--phase', required=True)
@@ -185,14 +284,19 @@ def main():
     a = p.parse_args()
     path = Path(a.config)
     c = json.loads(path.read_text())
-    if not c.get('enabled') or c.get('prepare_only', True):
+    if a.phase != 'recover' and (c.get('enabled') is not True or c.get('prepare_only') is not False):
         print(json.dumps({'ok': False, 'code': 'gateway_disabled'}))
         return 1
     if os.geteuid() != 0 or path.stat().st_uid != 0 or path.stat().st_mode & 0o022:
         raise SystemExit('operator_owned_config_required')
+    if a.phase == 'recover' and not Path(c['state_file']).exists():
+        print(json.dumps({'ok': True, 'code': 'nothing_owned', 'kept': []}))
+        return 0
     with Path(c['lock_file']).open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        result = MacNetwork(c).execute(a.phase, a.target, a.epoch)
+        if not acquire(lock, MAC_LOCK_WAIT):
+            print(json.dumps({'ok': False, 'code': 'busy'}))
+            return 1
+        result = MacNetwork(c, deadline=deadline).execute(a.phase, a.target, a.epoch)
     print(json.dumps(result))
     return 0 if result.get('ok') else 1
 
