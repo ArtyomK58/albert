@@ -135,7 +135,7 @@ class Controller:
                 subprocess.run(['/usr/bin/dscacheutil', '-flushcache'], capture_output=True,
                                timeout=8, check=True)
             return {'ok': proc.returncode == 0 and result.get('ok') is True,
-                    'code': str(result.get('code', ''))[:64],
+                    'code': str(result.get('code', ''))[:64], 'reason': str(result.get('reason', ''))[:64],
                     'kept': [str(x)[:64] for x in result.get('kept', [])[:32]]}
         except Exception:
             return {'ok': False, 'code': 'network_helper_outcome_unknown'}

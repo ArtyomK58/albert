@@ -9,6 +9,8 @@ import time
 
 
 PRIVATE = tuple(ipaddress.ip_network(s) for s in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
+OVERLAY = (ipaddress.ip_network('100.64.0.0/10'),)
+NON_UNICAST = tuple(ipaddress.ip_network(s) for s in ('0.0.0.0/8', '127.0.0.0/8', '169.254.0.0/16', '224.0.0.0/3'))
 
 # Timeout hierarchy, innermost first. Each layer starts work only when its whole
 # per-step timeout plus a fail-safe reserve still fits, so an outer layer never
@@ -60,6 +62,12 @@ def acquire(lock, seconds, clock=time.monotonic, sleep=time.sleep):
             sleep(0.1)
 
 
+def reason(error):
+    """A bounded machine code for operators; free-form OS text and paths are never returned."""
+    text = str(error)
+    return text if re.fullmatch(r'[a-z][a-z0-9_]{2,63}', text) else 'unexpected_error'
+
+
 def network(value):
     n = ipaddress.ip_network(value, strict=True)
     if n.version != 4:
@@ -80,7 +88,7 @@ def validate(c):
     transport = c.get('transport', 'personal_vpn')
     if transport not in ('personal_vpn', 'tailnet'):
         raise ValueError('unsupported_gateway_transport')
-    pools = (ipaddress.ip_network('100.64.0.0/10'),) if transport == 'tailnet' else PRIVATE
+    pools = OVERLAY if transport == 'tailnet' else PRIVATE
     if peer.prefixlen != 32 or not any(peer.subnet_of(p) for p in pools):
         raise ValueError('single_private_peer_required')
     prefixes = sorted(set(network(p) for p in c['corporate_prefixes']), key=str)
@@ -117,7 +125,23 @@ def validate(c):
     dns = ipaddress.ip_address(c['corporate_dns'])
     if not any(dns in p for p in prefixes):
         raise ValueError('dns_not_in_corporate_allowlist')
+    local_egress(c, prefixes + denied)
     return prefixes
+
+
+def local_egress(c, denied):
+    """Public sites that must leave through the client's own uplink, not the overlay exit."""
+    egress = [network(p) for p in c.get('local_egress_prefixes', [])]
+    if not egress:
+        return []
+    identifier(c.get('local_egress_interface'))
+    for p in egress:
+        # Narrow public destinations only: never a default, private or overlay range.
+        if p.prefixlen < 16 or any(p.overlaps(n) for n in PRIVATE + OVERLAY + NON_UNICAST):
+            raise ValueError('local_egress_must_be_narrow_public_prefix')
+        if any(p.overlaps(n) for n in denied):
+            raise ValueError('local_egress_overlaps_gateway_network')
+    return egress
 
 
 def render(c):

@@ -1,4 +1,5 @@
-"""At most one successful route restore per Mac boot/overlay interface generation."""
+"""At most one successful route restore per Mac boot/overlay interface generation,
+plus an idempotent public-site egress sync on every run."""
 import argparse
 import json
 import os
@@ -7,6 +8,21 @@ import subprocess
 
 
 def restore(c, run=subprocess.run):
+    try:
+        result = corporate(c, run)
+    except Exception:
+        result = {'ok': False, 'code': 'network_restore_unconfirmed', 'authentication_started': False}
+    if c.get('egress_command'):
+        # Public-site routes follow the current uplink on every run; corporate state is untouched.
+        try:
+            proc = run(c['egress_command'], capture_output=True, text=True, timeout=120)
+            result['egress'] = str(json.loads(proc.stdout).get('code', ''))[:64]
+        except Exception:
+            result['egress'] = 'egress_unconfirmed'
+    return result
+
+
+def corporate(c, run):
     source = json.loads(Path(c['link_config']).read_text()).get('tailnet_source')
     text = run(['/sbin/ifconfig'], capture_output=True, text=True, timeout=5).stdout
     interface = None
@@ -28,7 +44,7 @@ def restore(c, run=subprocess.run):
     result = json.loads(proc.stdout)
     if proc.returncode == 0 and result.get('ok'):
         temp = path.with_suffix('.new');temp.write_text(json.dumps(generation));temp.chmod(0o600);temp.replace(path)
-    return {k: result[k] for k in ('ok', 'code', 'authentication_started') if k in result}
+    return {k: result[k] for k in ('ok', 'code', 'reason', 'authentication_started') if k in result}
 
 
 def main():

@@ -70,7 +70,9 @@ class Modes:
                 and c.get('network_verified') is True and not self.config.get('maintenance')
                 and isinstance(c.get('network_hook'), list) and bool(c['network_hook']))
 
-    def switch(self, target, ident, force=False):
+    def switch(self, target, ident, force=False, repair_reasons=None):
+        """repair_reasons limits an unattended network-only repair of an already-ready mode to
+        definitive failures; any other failed check is reported without changing anything."""
         if target not in ('mac', 'vps'):
             return {'ok': False, 'code': 'invalid_mode', 'text': 'Неизвестный режим VPN.'}
         # This must precede even credential loading, target probing and filesystem writes.
@@ -107,11 +109,17 @@ class Modes:
             # A healthy session on the chosen host needs no login; only its network may be missing.
             network_only = live[target]['state'] == 'connected' and live[source]['state'] == 'disconnected' and not force
             if network_only and state.get('phase') == 'ready' and state.get('mode') == target:
-                if self.targets.mode_hook('verify', target).get('ok'):
+                checked = self.targets.mode_hook('verify', target)
+                if checked.get('ok'):
                     return {'ok': True, 'code': 'already_connected',
                             'text': 'VPN и маршрутизация шлюза уже применены для ' + ('VPS.' if target == 'vps' else 'Mac.')}
-            if not self.targets.mode_hook('preflight', target).get('ok'):
-                return {'ok': False, 'code': 'network_preflight_failed', 'text': 'Сетевые настройки режима ещё не прошли проверку.'}
+                if repair_reasons is not None and checked.get('reason') not in repair_reasons:
+                    return {'ok': False, 'code': 'verify_inconclusive', 'reason': checked.get('reason', ''),
+                            'text': 'Проверка шлюза не прошла по неоднозначной причине; изменения не вносились.'}
+            checked = self.targets.mode_hook('preflight', target)
+            if not checked.get('ok'):
+                return {'ok': False, 'code': 'network_preflight_failed', 'reason': checked.get('reason', ''),
+                        'text': 'Сетевые настройки режима ещё не прошли проверку.'}
             if not network_only:
                 credentials = self.credentials.load()
                 if not credentials:

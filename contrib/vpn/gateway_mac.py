@@ -13,10 +13,13 @@ import threading
 import time
 
 from gateway_plan import (Deadline, MAC_COMMAND_TIMEOUT, MAC_FAILSAFE_RESERVE, MAC_HELPER_BUDGET,
-                          MAC_LOCK_WAIT, acquire, validate)
+                          MAC_LOCK_WAIT, acquire, local_egress, reason, validate)
 
 ANCHOR = 'com.apple/frog-corp'
-PHASES = ('preflight', 'block', 'activate', 'verify', 'recover')
+PHASES = ('preflight', 'block', 'activate', 'verify', 'recover', 'egress')
+# Checks never change routes, resolvers or PF, not even to fail closed on their own failure.
+READ_ONLY = ('preflight', 'verify')
+
 
 
 def bounded_resolve(host, timeout):
@@ -66,7 +69,24 @@ class MacNetwork:
 
     def route_fields(self, prefix):
         r = self.command(['/sbin/route', '-n', 'get', '-net', prefix], check=False)
-        return dict(re.findall(r'(?m)^\s*(destination|mask|interface):\s*(\S+)\s*$', r.stdout))
+        return dict(re.findall(r'(?m)^\s*(destination|mask|gateway|interface):\s*(\S+)\s*$', r.stdout))
+
+    def uplink_gateway(self):
+        # The uplink's own scoped default survives an overlay exit node taking the global default.
+        interface = self.s['local_egress_interface']
+        r = self.command(['/sbin/route', '-n', 'get', '-ifscope', interface, 'default'], check=False)
+        f = dict(re.findall(r'(?m)^\s*(gateway|interface):\s*(\S+)\s*$', r.stdout))
+        try:
+            gateway = ipaddress.IPv4Address(f.get('gateway', ''))
+        except ValueError:
+            raise RuntimeError('local_egress_gateway_missing')
+        if f.get('interface') != interface:
+            raise RuntimeError('local_egress_gateway_missing')
+        return str(gateway)
+
+    def egress_route_ok(self, prefix, gateway):
+        f = self.route_fields(prefix)
+        return f.get('interface') == self.s['local_egress_interface'] and f.get('gateway') == gateway
 
     def route_interface(self, prefix):
         # Best route actually used for the destination.
@@ -140,6 +160,41 @@ class MacNetwork:
                 self.command(['/sbin/route', '-n', 'delete', '-net', prefix, '-interface', interface])
             del state['routes'][prefix]
             self.save(path, state)
+        for prefix, via in list(state.get('egress', {}).items()):
+            if self.exact_route(prefix) == via['interface'] and self.route_fields(prefix).get('gateway') == via['gateway']:
+                self.command(['/sbin/route', '-n', 'delete', '-net', prefix, via['gateway']])
+            del state['egress'][prefix]
+            self.save(path, state)
+
+    def sync_egress(self, state, path):
+        """Owned public host routes through the uplink while the gateway mode is ready.
+
+        Idempotent and independent of corporate routing: it never touches corporate routes,
+        resolvers or PF, and its failure only leaves those sites on the overlay exit."""
+        ready = state.get('mode') == 'vps' and state.get('phase') == 'ready'
+        wanted = {str(n) for n in local_egress(self.s, [])} if ready else set()
+        try:
+            gateway = self.uplink_gateway() if wanted else None
+        except RuntimeError:
+            gateway = None  # No uplink: nothing can leave locally until it returns.
+        state.setdefault('egress', {})
+        for prefix, via in list(state['egress'].items()):
+            if prefix in wanted and via['gateway'] == gateway and self.egress_route_ok(prefix, gateway):
+                continue
+            if self.exact_route(prefix) == via['interface'] and self.route_fields(prefix).get('gateway') == via['gateway']:
+                self.command(['/sbin/route', '-n', 'delete', '-net', prefix, via['gateway']])
+            del state['egress'][prefix]
+            self.save(path, state)
+        kept = []
+        for prefix in sorted(wanted - set(state['egress'])) if gateway else []:
+            if self.exact_route(prefix) is not None:
+                kept.append('foreign_route')  # Never adopted, never deleted.
+                continue
+            state['egress'][prefix] = {'gateway': gateway, 'interface': self.s['local_egress_interface']}
+            self.save(path, state)  # Recorded before creation; removal re-checks it.
+            self.command(['/sbin/route', '-n', 'add', '-net', prefix, gateway])
+        return {'ok': True, 'code': 'egress_synced', 'routes': len(state['egress']),
+                'uplink': gateway is not None, 'kept': kept}
 
     def preflight(self, target, state):
         if not all(self.c.get(k) is True for k in ('pf_policy_verified', 'dns_fail_closed_verified', 'ipv6_policy_verified')):
@@ -202,6 +257,14 @@ class MacNetwork:
                 self.save(path, state)
                 return {'ok': False, 'code': 'mac_recovery_incomplete'}
         validate(self.s)
+        if phase == 'egress':
+            # Not epoch-fenced: it follows the recorded mode under the helper lock.
+            if not path.exists():
+                return {'ok': True, 'code': 'nothing_owned', 'kept': []}
+            try:
+                return self.sync_egress(json.loads(path.read_text()), path)
+            except Exception as error:
+                return {'ok': False, 'code': 'egress_failed', 'reason': reason(error)}
         state = json.loads(path.read_text()) if path.exists() else {'epoch': 0, 'routes': {}, 'resolvers': {}}
         if epoch < state['epoch']:
             return {'ok': False, 'code': 'stale_mode_epoch'}
@@ -221,12 +284,16 @@ class MacNetwork:
                 address = self.resolve(self.c['probe_host'], 5)
                 if not any(ipaddress.ip_address(address) in ipaddress.ip_network(p) for p in self.s['corporate_prefixes']):
                     raise RuntimeError('probe_not_on_corporate_route')
-                with self.connect((address, self.c.get('probe_port', 443)), timeout=5):
-                    pass
+                try:
+                    with self.connect((address, self.c.get('probe_port', 443)), timeout=5):
+                        pass
+                except OSError:
+                    raise RuntimeError('probe_connect_failed')
                 return {'ok': True}
             state.update(epoch=epoch, phase='applying')
             state.setdefault('routes', {})
             state.setdefault('resolvers', {})
+            state.setdefault('egress', {})
             self.save(path, state)  # Lost replies cannot erase ownership/fencing.
             self.guard(state, path)
             self.withdraw(state, path)
@@ -255,6 +322,11 @@ class MacNetwork:
                         p.chmod(0o644)
                 self.guard(state, path, interface)
                 state.update(mode=target, phase='ready', active_interface=interface)
+                self.save(path, state)
+                try:
+                    self.sync_egress(state, path)
+                except Exception:
+                    pass  # Public-site routes never decide corporate readiness.
             else:
                 interface = self.route_interface(self.s['corporate_dns'])
                 try:
@@ -267,16 +339,17 @@ class MacNetwork:
                 state.update(mode=target, phase='ready', active_interface=interface)
             self.save(path, state)
             return {'ok': True}
-        except Exception:
-            if phase == 'preflight':
-                return {'ok': False, 'code': 'mac_network_preflight_failed'}
+        except Exception as error:
+            if phase in READ_ONLY:
+                # A failed check reports why; it never re-blocks a path that may still work.
+                return {'ok': False, 'code': 'mac_network_' + phase + '_failed', 'reason': reason(error)}
             try:
                 self.guard(state, path, reserve=0)  # Uses the reserved budget.
             except Exception:
                 pass
             state.update(epoch=epoch, phase='outcome_unknown')
             self.save(path, state)
-            return {'ok': False, 'code': 'mac_network_phase_failed'}
+            return {'ok': False, 'code': 'mac_network_phase_failed', 'reason': reason(error)}
 
     @staticmethod
     def save(path, state):

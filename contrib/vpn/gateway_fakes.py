@@ -46,6 +46,9 @@ class FakeMac:
         self.native = 'utun7'     # the native corporate client
         self.native_routes = {}   # prefix -> interface, owned by the native client
         self.routes = {}          # prefix -> interface, added through `route add`
+        self.uplink = ('en0', '192.0.2.1')  # the client's own scoped default; None when down
+        self.egress = {}          # prefix -> gateway, added through `route add -net P GW`
+        self.foreign_egress = {}  # prefix -> gateway, owned by somebody else
         self.forbidden = []
         self.slow = {}            # substring -> seconds consumed by the fake clock
         self.now = [0.0]
@@ -69,10 +72,16 @@ class FakeMac:
             if self.native_routes:
                 out += self.native + ': flags=8051<UP>\n\tinet 192.0.2.77 --> x\n'
             return done(args, 0, out)
+        if args[:5] == ['/sbin/route', '-n', 'get', '-ifscope', 'en0'] and args[5:] == ['default']:
+            if not self.uplink:
+                return done(args, 1, '', 'route: writing to routing socket: not in table')
+            return done(args, 0, '   route to: default\ndestination: default\n       mask: default\n'
+                        '    gateway: %s\n  interface: %s\n' % (self.uplink[1], self.uplink[0]))
         if args[:4] == ['/sbin/route', '-n', 'get', '-net']:
             target = ipaddress.ip_network(args[4], strict=False)
             best = None
-            for table in (self.native_routes, self.routes):
+            via = {p: ('en0', g) for p, g in list(self.egress.items()) + list(self.foreign_egress.items())}
+            for table in (self.native_routes, self.routes, via):
                 for prefix, name in table.items():
                     net = ipaddress.ip_network(prefix)
                     if target.subnet_of(net) and (best is None or net.prefixlen > best[0].prefixlen):
@@ -80,8 +89,25 @@ class FakeMac:
             if best is None:
                 return done(args, 0, '   route to: x\ndestination: default\n       mask: default\n  interface: en0\n')
             net, name = best
-            return done(args, 0, '   route to: x\ndestination: %s\n       mask: %s\n  interface: %s\n'
-                        % (net.network_address, net.netmask, name))
+            # A host route prints no mask, like the real tool.
+            mask = '' if net.prefixlen == 32 else '       mask: %s\n' % net.netmask
+            gateway = ''
+            if isinstance(name, tuple):
+                name, gateway = name[0], '    gateway: %s\n' % name[1]
+            return done(args, 0, '   route to: x\ndestination: %s\n%s%s  interface: %s\n'
+                        % (net.network_address, mask, gateway, name))
+        if args[:4] == ['/sbin/route', '-n', 'add', '-net'] and len(args) == 6:
+            if args[4] in self.egress or args[4] in self.foreign_egress or args[4] in self.routes:
+                return done(args, 1, '', 'File exists')
+            self.egress[args[4]] = args[5]
+            return done(args)
+        if args[:4] == ['/sbin/route', '-n', 'delete', '-net'] and len(args) == 6:
+            if self.egress.get(args[4]) == args[5]:
+                del self.egress[args[4]]
+                return done(args)
+            if args[4] in self.foreign_egress:
+                self.forbidden.append(args)
+            return done(args, 1)
         if args[:4] == ['/sbin/route', '-n', 'add', '-net']:
             if args[4] in self.routes or args[4] in self.native_routes:
                 return done(args, 1, '', 'File exists')
@@ -393,6 +419,16 @@ class World:
         result = {'exit_code': code, 'stdout': out.getvalue()}
         return done(a, code, json.dumps({'state': 'completed', 'result': result}))
 
+    def helper(self, phase):
+        """The Mac helper entry point alone, as a local sudo call would run it."""
+        out = io.StringIO()
+        argv = ['helper', '--config', str(self.mac_cfg), '--phase', phase, '--target', 'vps', '--epoch', '0']
+        with patch.object(sys, 'argv', argv), patch('sys.stdout', out), \
+                patch('gateway_mac.subprocess.run', self.mac), \
+                patch.object(gateway_mac.MacNetwork, '__init__', mac_init(self)):
+            gateway_mac.main()
+        return json.loads(out.getvalue())
+
     def hook(self, phase, target):
         out = io.StringIO()
         argv = ['hook', '--config', str(self.hook_cfg)]
@@ -400,8 +436,10 @@ class World:
                 patch('sys.stdin', io.StringIO(json.dumps({'phase': phase, 'target': target}) + '\n')), \
                 patch('gateway_hook.subprocess.run', self.host):
             code = gateway_hook.main()
-        value = json.loads(out.getvalue())
-        return {'ok': code == 0 and value.get('ok') is True, 'code': value.get('code', ''), 'kept': value.get('kept', [])}
+        self.hook_reply = out.getvalue()
+        value = json.loads(self.hook_reply)
+        return {'ok': code == 0 and value.get('ok') is True, 'code': value.get('code', ''),
+                'reason': value.get('reason', ''), 'kept': value.get('kept', [])}
 
     def modes(self):
         return Modes(self.config, self.targets, self.credentials, sleep=lambda s: None)

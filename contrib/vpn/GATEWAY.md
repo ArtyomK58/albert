@@ -156,7 +156,7 @@ personal VPN container's lifecycle or reconnect policy merely to prepare this op
 ## Tests
 
 Run the existing Python suite plus `test_gateway.py`, `test_gateway_network.py` and
-`test_gateway_recovery.py` and `test_gateway_budget.py` (simulators in
+`test_gateway_recovery.py`, `test_gateway_budget.py` and `test_gateway_egress.py` (simulators in
 `gateway_fakes.py`). Synthetic tests cover disabled side-effect freedom, route
 rejection, stop-confirm-start order, uncertain-outcome freeze, stale epochs across
 cache eviction and restart, recovery after failure/timeout/disablement with foreign
@@ -190,3 +190,34 @@ tunnel. Operator-owned scoped DNS must remain present during authentication and
 network withdrawal. Native Mac mode is refused while this ingress configuration
 is selected; changing exit-node ownership needs separate operator coordination.
 Unit tests do not substitute for attended DNS, PF, MFA and real-device acceptance.
+
+## Local egress for public sites
+
+An overlay exit node moves every public destination to the gateway's uplink. A
+public site that admits only the client's own network then refuses the request,
+and routing it into the corporate tunnel does not help: that tunnel carries only
+private prefixes. `local_egress_prefixes` (narrow public IPv4, `/16` or longer,
+never private, overlay, multicast or a gateway endpoint) plus
+`local_egress_interface` let the Mac helper's `egress` phase keep host routes
+through that uplink's own scoped default gateway while the VPS mode is ready.
+The phase is idempotent and separate from corporate routing: it never touches
+corporate routes, resolvers or PF, follows a changed uplink gateway, drops its
+routes when the uplink or the ready mode is gone, records routes before creating
+them and never adopts or deletes another owner's exact route. `activate` runs it
+best-effort after the mode is ready, so it never decides corporate readiness;
+`block` and `recover` remove only recorded routes that still match. The Mac
+restore job runs the configured `egress_command` on every run.
+
+`install_gateway_mac.py --upgrade [--egress FILE]` replaces the helper modules and
+merges only the two local-egress keys into the installed configuration, after
+validating it, and adds the `egress` phase to the fixed launcher, keeping one
+`.prev` generation; `--rollback` restores it. Neither runs a network command.
+
+## Read-only checks and unattended repair
+
+`preflight` and `verify` never change routes, resolvers or firewall state, even on
+their own failure; a failed switch is re-blocked by its explicit `block` phase.
+Failures carry a bounded `reason` code through the helper, controller, hook and
+mode switch. Unattended network restoration repairs an already-ready mode only for
+definitive route-state reasons (`REPAIRABLE` in `gateway_restore.py`); a failed DNS
+or TCP probe returns `verify_inconclusive` and changes nothing.

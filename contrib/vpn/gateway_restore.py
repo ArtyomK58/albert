@@ -9,6 +9,11 @@ from modes import Modes
 from targets import Targets
 
 
+# Missing or stale route state that only a re-application can repair. A failed DNS or TCP
+# probe may be a corporate-side outage; re-blocking for it would only break a working path.
+REPAIRABLE = ('route_verification_failed', 'mode_not_ready')
+
+
 class NoCredentials:
     def load(self):
         return None
@@ -31,8 +36,9 @@ def restore(config, targets=None):
     if (not live['vps'].get('ok') or live['vps'].get('state') != 'connected'
             or not live['mac'].get('ok') or live['mac'].get('state') != 'disconnected'):
         return {'ok': False, 'code': 'existing_vps_session_required', 'authentication_started': False}
-    result = modes.switch('vps', 'network:restore:' + str(time.time_ns()))
-    return {'ok': result.get('ok') is True, 'code': result.get('code', ''), 'authentication_started': False}
+    result = modes.switch('vps', 'network:restore:' + str(time.time_ns()), repair_reasons=REPAIRABLE)
+    return {'ok': result.get('ok') is True, 'code': result.get('code', ''), 'reason': result.get('reason', ''),
+            'authentication_started': False}
 
 
 def main():

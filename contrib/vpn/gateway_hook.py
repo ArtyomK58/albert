@@ -11,7 +11,7 @@ import sys
 import time
 
 from gateway_plan import (Deadline, HOOK_BUDGET, HOOK_LOCK_WAIT, HOST_COMMAND_TIMEOUT, HOST_FAILSAFE_RESERVE,
-                          MAC_CALL_TIMEOUT, MAC_LINK_EXEC_TIMEOUT, acquire, validate)
+                          MAC_CALL_TIMEOUT, MAC_LINK_EXEC_TIMEOUT, acquire, reason, validate)
 from tailnet_guard import TailnetGuard
 
 PHASES = ('preflight', 'block', 'activate', 'verify', 'recover')
@@ -111,7 +111,8 @@ class NetworkHook:
             self.deadline.admit(MAC_CALL_TIMEOUT, HOST_FAILSAFE_RESERVE)
             result = Targets(json.loads(path.read_text())).mac_network(phase, target, epoch)
             if result.get('ok') is not True:
-                raise RuntimeError('mac_network_not_verified')
+                # The helper's bounded reason, e.g. a missing route versus a failed probe.
+                raise RuntimeError(reason(result.get('reason') or 'mac_network_not_verified'))
             return result
         argv = self.c.get('mac_command', [])
         if not argv or not all(isinstance(x, str) for x in argv):
@@ -129,7 +130,7 @@ class NetworkHook:
             raise RuntimeError('mac_network_outcome_unknown')
         inner = json.loads(value['result'].get('stdout') or '{}')
         if r.returncode or value['result'].get('exit_code') != 0 or inner.get('ok') is not True:
-            raise RuntimeError('mac_network_not_verified')
+            raise RuntimeError(reason(inner.get('reason') or 'mac_network_not_verified'))
         return inner
 
     def ip_json(self, args):
@@ -443,13 +444,14 @@ class NetworkHook:
             else:
                 self.mac('verify', target, epoch)
             return {'ok': True}
-        except Exception:
-            if phase != 'preflight':
+        except Exception as error:
+            # Checks are read-only. A failed switch is re-blocked by its own explicit block phase.
+            if phase not in ('preflight', 'verify'):
                 try:
                     self.host_filter(False, reserve=0)  # Uses the reserved budget.
                 except Exception:
                     pass
-            return {'ok': False, 'code': 'network_phase_failed'}
+            return {'ok': False, 'code': 'network_phase_failed', 'reason': reason(error)}
 
 
 def main():

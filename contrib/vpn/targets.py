@@ -85,7 +85,8 @@ class Targets:
             value = json.loads(result.stdout)
             kept = value.get('kept') if isinstance(value.get('kept'), list) else []
             return {'ok': result.returncode == 0 and value.get('ok') is True,
-                    'code': str(value.get('code', ''))[:64], 'kept': [str(x)[:64] for x in kept[:32]]}
+                    'code': str(value.get('code', ''))[:64], 'reason': str(value.get('reason', ''))[:64],
+                    'kept': [str(x)[:64] for x in kept[:32]]}
         except subprocess.TimeoutExpired:
             return {'ok': False, 'code': 'network_hook_timeout'}
         except Exception:
