@@ -55,9 +55,11 @@ overlap with protected local/management networks. Public push routes need a
 separate review rather than silent import.
 
 The renderer is a review artifact, not an executable deployment or rollback script.
-An operator-owned network hook is deliberately not supplied or installed by this
-preparation. Until that hook is implemented and accepted, `network_verified` must
-stay false. Do not interpret a successful render as a working gateway.
+`gateway_hook.py` and `gateway_mac.py` supply separately gated, operator-owned
+network backends. Their manifests also default to disabled/preparation-only.
+They are staged without installing the Mac privileged helper or running any
+network phase. Until privileged installation and attended acceptance are complete,
+`network_verified` must stay false. A successful render is not a working gateway.
 
 The future hook accepts one JSON object on stdin with `phase` and `target`:
 `preflight` checks control-channel reachability, current topology, peer isolation,
@@ -65,9 +67,21 @@ route ownership and supervisor reconnect policy; `block` is an idempotent
 fail-closed withdrawal; `activate` installs exactly the reviewed target's routing
 and DNS; `verify` checks real service/DNS access and leakage. It must return bounded
 JSON with `ok`. The executable must be root-owned and not group/world writable.
-The hook must transact owned rules without flushing shared Docker chains or
-changing the host default route/global ip_forward. Apply and rollback must use
-the current generation and exact owned resources, not replay this rendered list.
+The host backend updates only dedicated firewall chains with atomic restore,
+retains unreachable fallback routes, verifies container identity and owns a
+manifest signature. It exposes the peer only after the namespace and Mac are ready.
+The Mac backend uses an existing Apple PF anchor, retains corporate blocking during
+handover, records exact route/resolver ownership and rejects stale epochs. It never
+rewrites pf.conf or disables another owner's PF. Installation requires root-owned
+code/config and a narrowly scoped privileged invocation, not a password in the bot.
+Apply and withdrawal use the current generation, not a replay of the rendered list.
+
+`install_gateway_mac.py` is the separate attended root installation step. It
+accepts disabled manifests only and stages a fixed-config isolated launcher with
+a narrowly scoped sudo rule; it does not run PF, route, DNS or VPN commands.
+Its launcher accepts only the enumerated phase/target and an integer epoch, never
+an alternate configuration path or a shell command. Preparing this installer does
+not authorize running it or requesting an administrator prompt.
 
 Activation still requires a controlled MFA cycle, split-DNS/fallback/IPv6 tests,
 another-peer denial, namespace recreation, route collision checks and a latency

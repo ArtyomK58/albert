@@ -92,6 +92,9 @@ def render(c):
                        '--ctstate', 'ESTABLISHED,RELATED', '-j', 'ACCEPT'])
     op('guards', ['iptables', '-w', '-A', 'FROG_CORP', '-i', c['host_veth'], '-o', c['host_bridge'],
                   '-d', peer, '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-j', 'ACCEPT'])
+    op('guards', ['iptables', '-w', '-A', 'FROG_CORP', '-o', c['host_veth'],
+                  '-d', c['namespace_link_address'] + '/32', '-m', 'conntrack',
+                  '--ctstate', 'ESTABLISHED,RELATED', '-j', 'ACCEPT'])
     for p in prefixes:
         dest = str(p)
         # Unreachable entries stay when a tunnel/link disappears; no WAN fallback.
