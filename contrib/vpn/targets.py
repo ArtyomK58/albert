@@ -10,6 +10,7 @@ import time
 import urllib.request
 
 from gateway_plan import HOOK_PROCESS_TIMEOUT, MAC_CALL_TIMEOUT
+from session_clock import process_session
 
 
 def command(args, timeout=25):
@@ -50,7 +51,10 @@ class Targets:
         try:
             output = command([self.config['vps_command'], 'status']).stdout
             up = 'owned=yes' in output and 'tcp=estab' in output and 'state=up' in output
-            return {'ok': True, 'state': 'connected' if up else 'disconnected'}
+            meta = process_session(self.config.get('vps_session_pid_file'),
+                                   self.config.get('vps_namespace_file'),
+                                   self.config.get('vps_process_binary')) if up else {}
+            return {'ok': True, 'state': 'connected' if up else 'disconnected', **meta}
         except (OSError, subprocess.TimeoutExpired):
             return {'ok': False, 'state': 'unknown', 'code': 'vps_unavailable'}
 

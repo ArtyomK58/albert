@@ -58,6 +58,7 @@ class Broker:
 
     def status(self):
         statuses = {'vps': self.targets.vps_status(), 'mac': self.targets.mac('status')}
+        self.observe_vps_session(statuses['vps'])
         lines = ['VPN']
         labels = {'connected': 'подключён', 'disconnected': 'не подключён',
                   'connecting': 'подключается', 'disconnecting': 'отключается', 'unknown': 'нет связи'}
@@ -66,7 +67,8 @@ class Broker:
             text = label + ': ' + labels.get(state, 'нет связи')
             session = self.state['sessions'].get(host, {})
             start = session.get('started_at')
-            if start and state == 'connected':
+            clock_known = host != 'vps' or not self.config.get('vps_session_pid_file') or bool(statuses[host].get('session_id'))
+            if start and state == 'connected' and clock_known:
                 remaining = max(0, int(start + self.config['session_seconds'] - time.time()))
                 text += f'; ориентировочно {remaining // 3600} ч {(remaining % 3600) // 60} мин до повторного входа'
             elif state == 'connected':
@@ -75,6 +77,21 @@ class Broker:
         if not self.credentials.load():
             lines.append('Реквизиты нужно сохранить один раз: /vpn_setup')
         return {'ok': True, 'text': '\n'.join(lines), 'targets': statuses}
+
+    def observe_vps_session(self, status):
+        if not isinstance(status, dict) or not status.get('ok') or status.get('state') != 'connected':
+            return
+        generation, started = status.get('session_id'), status.get('session_started_at')
+        if (not isinstance(generation, str) or not generation or type(started) not in (int, float)
+                or not 0 < started <= time.time() + 5):
+            return
+        with self.state_lock:
+            previous = self.state['sessions'].get('vps', {})
+            if previous.get('session_id') != generation:
+                # Authentication and network readiness are independent. A new confirmed
+                # process starts a new clock even when subsequent routing checks fail.
+                self.state['sessions'] = {'vps': {'started_at': started, 'session_id': generation, 'warned': False}}
+                self.persist()
 
     def setup(self):
         token = secrets.token_urlsafe(32)
@@ -175,6 +192,10 @@ class Broker:
                 except Exception:
                     result = {'text': 'Переключение VPN не подтверждено из-за внутренней ошибки. '
                                       'Повторный вход и MFA не запускались; проверь /vpn_mode.'}
+                try:
+                    self.observe_vps_session(self.targets.vps_status())
+                except Exception:
+                    pass  # Clock observation cannot suppress the operation's result.
                 self.notify(result['text'])
             finally:
                 self.lock.release()
@@ -263,8 +284,12 @@ class Broker:
     def tick(self):
         if self.config.get('maintenance'):
             return
+        live = self.targets.vps_status()
+        self.observe_vps_session(live)
         now = time.time()
         for host, session in list(self.state['sessions'].items()):
+            if host == 'vps' and self.config.get('vps_session_pid_file') and not live.get('session_id'):
+                continue
             if not session.get('warned') and now >= session['started_at'] + self.config['session_seconds'] - self.config['warning_seconds']:
                 remaining = max(0, int((session['started_at'] + self.config['session_seconds'] - now) / 60))
                 # Persist before delivery. An unknown Telegram outcome must not

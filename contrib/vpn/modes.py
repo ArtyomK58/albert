@@ -37,12 +37,16 @@ class Modes:
         elif ready:
             text = ('Режим одной корпоративной сессии включён; последнее подтверждённое применение шлюза: '
                     + ('VPS.' if mode == 'vps' else 'Mac.'))
+        elif phase == 'switching':
+            text = 'Переключение VPN выполняется. После входа проверяются устойчивость сессии и маршруты; повторять команду не нужно.'
+        elif phase == 'recovering':
+            text = 'Выполняется снятие сетевых изменений шлюза. VPN-сессии не запускаются и не останавливаются.'
         else:
             text = 'Режим одной корпоративной сессии включён в настройках, но маршрутизация шлюза сейчас не применена.'
             if phase not in FROZEN and phase != 'unreadable':
                 text += (' /vpn_vps или /vpn_mac применит её; если сессия на выбранном устройстве уже работает, '
                          'новый вход не нужен.')
-        if phase in FROZEN:
+        if phase in FROZEN and phase not in ('switching', 'recovering'):
             text += ' Предыдущее переключение не подтверждено; новые входы заблокированы. Снять изменения шлюза: /vpn_recover.'
         elif phase == 'unreadable':
             text += ' ' + UNREADABLE['text']
@@ -124,7 +128,9 @@ class Modes:
                 credentials = self.credentials.load()
                 if not credentials:
                     return {'ok': False, 'code': 'credentials_missing', 'text': 'Сначала сохрани реквизиты VPN.'}
-            state.update(epoch=state['epoch'] + 1, phase='switching', requested_mode=target)
+            state.update(epoch=state['epoch'] + 1, phase='switching', requested_mode=target, step='blocking')
+            state.pop('failure_step', None)
+            state.pop('network_reason', None)
             epoch = state['epoch']
             state['requests'][ident] = 'running'
             self.persist(state_path, state)
@@ -136,6 +142,8 @@ class Modes:
                 # No stop, start, credentials or MFA: the existing session must still be the only one.
                 end = time.monotonic()
             else:
+                state['step'] = 'stopping'
+                self.persist(state_path, state)
                 if live[old]['state'] == 'connected':
                     result = self.targets.mode_stop(old, ident, epoch)
                     if not result.get('ok'):
@@ -143,10 +151,14 @@ class Modes:
                 after = self.targets.mode_snapshot()
                 if any(after[h].get('state') != 'disconnected' or not after[h].get('ok') for h in ('mac', 'vps')):
                     raise RuntimeError('stop_not_confirmed')
+                state['step'] = 'authenticating'
+                self.persist(state_path, state)
                 result = self.targets.mode_start(target, credentials, ident, epoch)
                 if not result.get('ok') or result.get('state') != 'connected':
                     raise RuntimeError('new_session_not_confirmed')
                 end = time.monotonic() + max(60, c.get('verify_seconds', 60))
+            state['step'] = 'stabilizing'
+            self.persist(state_path, state)
             while True:
                 snap = self.targets.mode_snapshot()
                 if (not snap[target].get('ok') or snap[target].get('state') != 'connected'
@@ -155,11 +167,19 @@ class Modes:
                 if time.monotonic() >= end:
                     break
                 self.sleep(min(2, max(0, end - time.monotonic())))
-            if not self.targets.mode_hook('activate', target).get('ok'):
+            state['step'] = 'applying_routes'
+            self.persist(state_path, state)
+            checked = self.targets.mode_hook('activate', target)
+            if not checked.get('ok'):
+                state['network_reason'] = checked.get('reason', '')
                 raise RuntimeError('gateway_activation_failed')
-            if not self.targets.mode_hook('verify', target).get('ok'):
+            state['step'] = 'verifying_routes'
+            self.persist(state_path, state)
+            checked = self.verify_network(target, source)
+            if not checked.get('ok'):
+                state['network_reason'] = checked.get('reason', '')
                 raise RuntimeError('network_verification_failed')
-            state.update(phase='ready', mode=target)
+            state.update(phase='ready', mode=target, step='ready')
             state['requests'][ident] = 'done'
             self.persist(state_path, state)
             where = 'VPS.' if target == 'vps' else 'Mac.'
@@ -176,6 +196,7 @@ class Modes:
                 except Exception:
                     pass
                 state['phase'] = 'outcome_unknown'
+                state['failure_step'] = state.get('step', 'unknown')
                 state['requests'][ident] = 'outcome_unknown'
                 self.persist(state_path, state)
             return {'ok': False, 'code': 'outcome_unknown',
@@ -184,6 +205,21 @@ class Modes:
             if credentials:
                 credentials.clear()
             lock.close()
+
+    def verify_network(self, target, source):
+        # Native DNS can retain an unavailable-server backoff while MFA blocks its
+        # route. Retry only read-only readiness probes; never restart login or routes.
+        for attempt in range(4):
+            result = self.targets.mode_hook('verify', target)
+            if result.get('ok') or result.get('reason') not in ('probe_resolution_failed', 'probe_connect_failed'):
+                return result
+            if attempt == 3:
+                return result
+            live = self.targets.mode_snapshot()
+            if (not live[target].get('ok') or live[target].get('state') != 'connected'
+                    or not live[source].get('ok') or live[source].get('state') != 'disconnected'):
+                return {'ok': False, 'reason': 'connection_not_retained'}
+            self.sleep(2)
 
     def state_path(self):
         value = self.option().get('state_file')

@@ -221,3 +221,20 @@ Failures carry a bounded `reason` code through the helper, controller, hook and
 mode switch. Unattended network restoration repairs an already-ready mode only for
 definitive route-state reasons (`REPAIRABLE` in `gateway_restore.py`); a failed DNS
 or TCP probe returns `verify_inconclusive` and changes nothing.
+## Session clock and readiness
+
+The optional operator settings `vps_session_pid_file`, `vps_namespace_file` and
+`vps_process_binary` enable a clock derived from the confirmed supervisor-owned
+process generation. The PID file must be root owned; executable identity and
+network-namespace identity must match. Process start is a conservative estimate
+that includes authentication time. No credential or raw VPN log is read.
+
+The broker updates this clock after confirmed authentication even when later
+network readiness fails. Network-only restoration never renews the session
+clock. If the live generation cannot be validated, status reports the clock as
+unknown rather than displaying an older session's remaining time.
+
+New sessions receive bounded retries of read-only DNS/TCP readiness probes.
+These retries never start authentication or reapply routes. In-progress status
+is distinct from a failed switch; failed switches retain their network stage
+and bounded reason for operator diagnosis.
