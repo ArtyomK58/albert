@@ -181,4 +181,3 @@ tunnel. Operator-owned scoped DNS must remain present during authentication and
 network withdrawal. Native Mac mode is refused while this ingress configuration
 is selected; changing exit-node ownership needs separate operator coordination.
 Unit tests do not substitute for attended DNS, PF, MFA and real-device acceptance.
-
