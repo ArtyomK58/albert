@@ -164,8 +164,12 @@ class Broker:
 
         def work():
             try:
-                result = Modes(self.config, self.targets, self.credentials).switch(
-                    target, request.get('request_id'), force)
+                try:
+                    result = Modes(self.config, self.targets, self.credentials).switch(
+                        target, request.get('request_id'), force)
+                except Exception:
+                    result = {'text': 'Переключение VPN не подтверждено из-за внутренней ошибки. '
+                                      'Повторный вход и MFA не запускались; проверь /vpn_mode.'}
                 self.notify(result['text'])
             finally:
                 self.lock.release()
@@ -179,7 +183,11 @@ class Broker:
 
         def work():
             try:
-                result = Modes(self.config, self.targets, None).recover(request.get('request_id'))
+                try:
+                    result = Modes(self.config, self.targets, None).recover(request.get('request_id'))
+                except Exception:
+                    result = {'text': 'Восстановление шлюза не выполнено из-за внутренней ошибки. '
+                                      'Вход и MFA не запускались; новые входы остаются заблокированными.'}
                 self.notify(result['text'])
             finally:
                 self.lock.release()

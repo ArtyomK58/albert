@@ -18,6 +18,7 @@ HOST_CHAIN = 'FROG_CG_HOST'
 NS_CHAINS = (('filter', 'FROG_CG_NS', 'FORWARD'), ('nat', 'FROG_CG_SNAT', 'POSTROUTING'),
              ('mangle', 'FROG_CG_MSS', 'FORWARD'))
 CONTAINER_CHAIN = ('nat', 'FROG_CG_BYPASS', 'POSTROUTING')
+RULE_CORE = ('priority', 'iif', 'src', 'srclen', 'dst', 'dstlen', 'table')
 NS_SYSCTL = (('net.ipv4.ip_forward', '1'), ('net.ipv4.conf.all.rp_filter', '2'))
 
 
@@ -124,14 +125,39 @@ class NetworkHook:
         return json.loads(r.stdout or '[]')
 
     @staticmethod
-    def rule_matches(x, s, prefix):
+    def rule_args(s, prefix):
+        return ['priority', str(s['rule_priority']), 'iif', s['host_bridge'], 'from', s['mac_peer'],
+                'to', prefix, 'lookup', str(s['table'])]
+
+    @staticmethod
+    def delete_candidates(rules, s, prefix):
+        """Every rule our `ip rule del` request could remove.
+
+        The kernel compares only the selectors a delete request carries, so a rule with
+        the same tuple plus any extra selector (fwmark, uidrange, ipproto, ...) or a
+        different protocol is also a candidate. Deletion is safe only when there is
+        exactly one candidate and it is the rule this hook recorded."""
         peer, net = ipaddress.ip_network(s['mac_peer']), ipaddress.ip_network(prefix)
-        # Extra selectors (for example fwmark) mean the rule is not the one we created.
-        return (x.get('priority') == s['rule_priority'] and x.get('iif') == s['host_bridge']
+        return [x for x in rules
+                if x.get('priority') == s['rule_priority'] and x.get('iif') == s['host_bridge']
                 and x.get('src') == str(peer.network_address) and x.get('srclen', 32) == peer.prefixlen
                 and x.get('dst') == str(net.network_address) and x.get('dstlen', 32) == net.prefixlen
-                and str(x.get('table')) == str(s['table'])
-                and set(x) <= {'priority', 'iif', 'src', 'srclen', 'dst', 'dstlen', 'table', 'protocol', 'flags'})
+                and str(x.get('table')) == str(s['table'])]
+
+    @staticmethod
+    def rule_extras(x):
+        # Attributes beyond our selectors, including kernel defaults, as observed at creation.
+        return {k: v for k, v in x.items() if k not in RULE_CORE}
+
+    def owned_rule(self, rules, s, prefix, resources):
+        """Return the single unambiguous owned rule, None if absent, or raise when ambiguous."""
+        candidates = self.delete_candidates(rules, s, prefix)
+        if not candidates:
+            return None
+        recorded = resources.get('rule_attrs', {}).get(prefix)
+        if len(candidates) == 1 and recorded is not None and self.rule_extras(candidates[0]) == recorded:
+            return candidates[0]
+        raise RuntimeError('ambiguous_policy_rule_requires_operator')
 
     @staticmethod
     def corporate(dst, s):
@@ -219,10 +245,15 @@ class NetworkHook:
         for p in s['corporate_prefixes']:
             self.command(['ip', 'route', 'replace', 'unreachable', p, 'table', str(s['table']), 'metric', '32760'])
             self.command(['ip', '-n', s['namespace'], 'route', 'replace', 'unreachable', p, 'metric', '32760'])
-            rule = ['priority', str(s['rule_priority']), 'iif', s['host_bridge'], 'from', s['mac_peer'], 'to', p, 'lookup', str(s['table'])]
-            # Duplicated rules are removed by exact ownership tuple, never by priority alone.
-            self.command(['ip', 'rule', 'del'] + rule, check=False)
-            self.command(['ip', 'rule', 'add'] + rule)
+            # Never delete-and-re-add: a delete could hit a foreign rule with extra selectors.
+            resources = self.owner()['resources']
+            if self.owned_rule(self.ip_json(['ip', '-j', 'rule', 'show']), s, p, resources) is None:
+                self.command(['ip', 'rule', 'add'] + self.rule_args(s, p))
+                created = self.delete_candidates(self.ip_json(['ip', '-j', 'rule', 'show']), s, p)
+                if len(created) != 1:
+                    raise RuntimeError('ambiguous_policy_rule_requires_operator')
+                attrs = dict(resources.get('rule_attrs', {}), **{p: self.rule_extras(created[0])})
+                self.record(rule_attrs=attrs)
             self.command(['ip', 'route', 'replace', p, 'via', s['namespace_link_address'], 'dev', s['host_veth'], 'table', str(s['table']), 'metric', '10'])
         bypass = ['-s ' + s['mac_peer'] + ' -d ' + p + ' -j ACCEPT' for p in s['corporate_prefixes']]
         self.chain(['docker', 'exec', '-i', s['container']], 'nat', 'FROG_CG_BYPASS', 'POSTROUTING', bypass)
@@ -275,17 +306,26 @@ class NetworkHook:
             step('container_chain', container)
         if res.get('rules'):
             def rules():
-                for x in self.ip_json(['ip', '-j', 'rule', 'show']):
-                    for p in s['corporate_prefixes']:
-                        if self.rule_matches(x, s, p):
-                            self.command(['ip', 'rule', 'del', 'priority', str(s['rule_priority']), 'iif', s['host_bridge'],
-                                          'from', s['mac_peer'], 'to', p, 'lookup', str(s['table'])])
+                ambiguous = False
+                for p in s['corporate_prefixes']:
+                    current = self.ip_json(['ip', '-j', 'rule', 'show'])
+                    try:
+                        ours = self.owned_rule(current, s, p, res)
+                    except RuntimeError:
+                        ambiguous = True  # Keep every candidate; an operator must reconcile.
+                        continue
+                    if ours is not None:
+                        self.command(['ip', 'rule', 'del'] + self.rule_args(s, p))
+                        after = self.ip_json(['ip', '-j', 'rule', 'show'])
+                        if [x for x in current if x is not ours] != after:
+                            raise RuntimeError('policy_rule_delete_unverified')
                 remaining = self.ip_json(['ip', '-j', 'rule', 'show'])
-                if any(self.rule_matches(x, s, p) for x in remaining for p in s['corporate_prefixes']):
-                    raise RuntimeError('owned_rule_still_present')
                 if any(x.get('priority') == s['rule_priority'] or str(x.get('table')) == str(s['table']) for x in remaining):
                     kept.append('foreign_rule')
-                done('rules')
+                if ambiguous:
+                    kept.append('ambiguous_policy_rule')
+                    raise RuntimeError('ambiguous_policy_rule_requires_operator')
+                done('rules', 'rule_attrs')
             step('rules', rules)
         if res.get('table_routes'):
             def table():

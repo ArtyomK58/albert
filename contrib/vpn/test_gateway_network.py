@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 from gateway_hook import NetworkHook
 from gateway_mac import MacNetwork
+from gateway_fakes import FakeHost
 from test_gateway import fixture
 
 
@@ -39,9 +40,10 @@ class NetworkTests(unittest.TestCase):
 
     def test_vps_exposes_peer_only_after_namespace_and_mac_are_ready(self):
         events = []
+        host = FakeHost(fixture())  # models kernel rule listing and exact-tuple deletion
         def run(args, **kwargs):
             events.append(('command', args, kwargs.get('input')))
-            return subprocess.CompletedProcess(args, 0, '', '')
+            return host(args, **kwargs)
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
         obj = NetworkHook({'enabled': True, 'prepare_only': False, 'network': fixture(),

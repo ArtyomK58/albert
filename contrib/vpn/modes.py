@@ -7,6 +7,9 @@ import time
 
 FROZEN = ('switching', 'outcome_unknown', 'failed', 'recovering', 'recovery_incomplete')
 REQUEST_ID = r'[A-Za-z0-9:_-]{8,128}'
+UNREADABLE = {'ok': False, 'code': 'operator_reconciliation_required',
+              'text': 'Файл состояния шлюза нечитаем. Новые входы и автоматическое восстановление заблокированы; '
+                      'файл сохранён для проверки оператором.'}
 
 
 class Modes:
@@ -23,18 +26,43 @@ class Modes:
     def status(self):
         c = self.option()
         active = self.allowed()
-        text = ('Режим шлюза подготовлен, но выключен. Корпоративная сессия и маршруты не переключаются.'
-                if not active else 'Режим одной корпоративной сессии включён.')
-        phase = None
+        phase = mode = None
         if self.recoverable():
-            try:
-                phase = json.loads(self.state_path().read_text()).get('phase')
-            except (OSError, ValueError, AttributeError):
-                phase = 'unreadable'
-            if phase in FROZEN or phase == 'unreadable':
-                text += ' Предыдущее переключение не подтверждено; новые входы заблокированы. Снять изменения шлюза: /vpn_recover.'
-        return {'ok': True, 'text': text, 'gateway': {'enabled': active, 'prepared': bool(c), 'phase': phase,
+            state, broken = self.load_state(self.state_path())
+            phase, mode = ('unreadable', None) if broken else (state.get('phase'), state.get('mode'))
+        ready = phase == 'ready' and mode in ('mac', 'vps')
+        # Configured is not active: a connected VPN session alone does not route the gateway.
+        if not active:
+            text = 'Режим шлюза подготовлен, но выключен. Корпоративная сессия и маршруты не переключаются.'
+        elif ready:
+            text = ('Режим одной корпоративной сессии включён; последнее подтверждённое применение шлюза: '
+                    + ('VPS.' if mode == 'vps' else 'Mac.'))
+        else:
+            text = 'Режим одной корпоративной сессии включён в настройках, но маршрутизация шлюза сейчас не применена.'
+            if phase not in FROZEN and phase != 'unreadable':
+                text += (' /vpn_vps или /vpn_mac применит её; если сессия на выбранном устройстве уже работает, '
+                         'новый вход не нужен.')
+        if phase in FROZEN:
+            text += ' Предыдущее переключение не подтверждено; новые входы заблокированы. Снять изменения шлюза: /vpn_recover.'
+        elif phase == 'unreadable':
+            text += ' ' + UNREADABLE['text']
+        return {'ok': True, 'text': text, 'gateway': {'enabled': active, 'active': bool(active and ready),
+                'prepared': bool(c), 'phase': phase, 'mode': mode if ready else None,
                 'preferred_mode': c.get('preferred_mode', 'vps'), 'network_verified': c.get('network_verified', False)}}
+
+    @staticmethod
+    def load_state(path):
+        """Return (state, broken). A damaged file is reported, never rewritten."""
+        if not path.exists():
+            return {'epoch': 0, 'requests': {}}, False
+        try:
+            state = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None, True
+        if (not isinstance(state, dict) or type(state.get('epoch')) is not int
+                or not isinstance(state.get('requests'), dict)):
+            return None, True
+        return state, False
 
     def allowed(self):
         c = self.option()
@@ -60,7 +88,10 @@ class Modes:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {'ok': False, 'code': 'busy', 'text': 'Переключение VPN уже выполняется.'}
-            state = json.loads(state_path.read_text()) if state_path.exists() else {'epoch': 0, 'requests': {}}
+            loaded, broken = self.load_state(state_path)
+            if broken:
+                return dict(UNREADABLE)
+            state = loaded
             if ident in state['requests']:
                 return {'ok': True, 'code': 'already_seen', 'text': 'Этот запрос уже принят; повторный вход не отправлен.'}
             if state.get('phase') in FROZEN:
@@ -73,13 +104,17 @@ class Modes:
             if all(live[h]['state'] == 'connected' for h in ('mac', 'vps')):
                 return {'ok': False, 'code': 'conflict', 'text': 'Обнаружены две сессии. Нужна проверка владельца VPN.'}
             source = 'vps' if target == 'mac' else 'mac'
-            if live[target]['state'] == 'connected' and live[source]['state'] == 'disconnected' and not force:
-                return {'ok': True, 'code': 'already_connected', 'text': 'VPN уже подключён на выбранном устройстве.'}
+            # A healthy session on the chosen host needs no login; only its network may be missing.
+            network_only = live[target]['state'] == 'connected' and live[source]['state'] == 'disconnected' and not force
+            if network_only and state.get('phase') == 'ready' and state.get('mode') == target:
+                return {'ok': True, 'code': 'already_connected',
+                        'text': 'VPN и маршрутизация шлюза уже применены для ' + ('VPS.' if target == 'vps' else 'Mac.')}
             if not self.targets.mode_hook('preflight', target).get('ok'):
                 return {'ok': False, 'code': 'network_preflight_failed', 'text': 'Сетевые настройки режима ещё не прошли проверку.'}
-            credentials = self.credentials.load()
-            if not credentials:
-                return {'ok': False, 'code': 'credentials_missing', 'text': 'Сначала сохрани реквизиты VPN.'}
+            if not network_only:
+                credentials = self.credentials.load()
+                if not credentials:
+                    return {'ok': False, 'code': 'credentials_missing', 'text': 'Сначала сохрани реквизиты VPN.'}
             state.update(epoch=state['epoch'] + 1, phase='switching', requested_mode=target)
             epoch = state['epoch']
             state['requests'][ident] = 'running'
@@ -88,17 +123,21 @@ class Modes:
             if not self.targets.mode_hook('block', target).get('ok'):
                 raise RuntimeError('gateway_block_failed')
             old = target if live[target]['state'] == 'connected' else source
-            if live[old]['state'] == 'connected':
-                result = self.targets.mode_stop(old, ident, epoch)
-                if not result.get('ok'):
+            if network_only:
+                # No stop, start, credentials or MFA: the existing session must still be the only one.
+                end = time.monotonic()
+            else:
+                if live[old]['state'] == 'connected':
+                    result = self.targets.mode_stop(old, ident, epoch)
+                    if not result.get('ok'):
+                        raise RuntimeError('stop_not_confirmed')
+                after = self.targets.mode_snapshot()
+                if any(after[h].get('state') != 'disconnected' or not after[h].get('ok') for h in ('mac', 'vps')):
                     raise RuntimeError('stop_not_confirmed')
-            after = self.targets.mode_snapshot()
-            if any(after[h].get('state') != 'disconnected' or not after[h].get('ok') for h in ('mac', 'vps')):
-                raise RuntimeError('stop_not_confirmed')
-            result = self.targets.mode_start(target, credentials, ident, epoch)
-            if not result.get('ok') or result.get('state') != 'connected':
-                raise RuntimeError('new_session_not_confirmed')
-            end = time.monotonic() + max(60, c.get('verify_seconds', 60))
+                result = self.targets.mode_start(target, credentials, ident, epoch)
+                if not result.get('ok') or result.get('state') != 'connected':
+                    raise RuntimeError('new_session_not_confirmed')
+                end = time.monotonic() + max(60, c.get('verify_seconds', 60))
             while True:
                 snap = self.targets.mode_snapshot()
                 if (not snap[target].get('ok') or snap[target].get('state') != 'connected'
@@ -114,7 +153,12 @@ class Modes:
             state.update(phase='ready', mode=target)
             state['requests'][ident] = 'done'
             self.persist(state_path, state)
-            return {'ok': True, 'code': 'switched', 'text': 'VPN переключён на ' + ('VPS.' if target == 'vps' else 'Mac.')}
+            where = 'VPS.' if target == 'vps' else 'Mac.'
+            if network_only:
+                return {'ok': True, 'code': 'network_restored',
+                        'text': 'Маршрутизация шлюза применена для уже работающей сессии на ' + where
+                                + ' Новый вход и MFA не выполнялись.'}
+            return {'ok': True, 'code': 'switched', 'text': 'VPN переключён на ' + where}
         except Exception:
             # Do not chase another session, retry MFA, restore the old session or stop a foreign one.
             if 'state' in locals() and state.get('phase') == 'switching':
@@ -158,7 +202,9 @@ class Modes:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {'ok': False, 'code': 'busy', 'text': 'Переключение VPN ещё выполняется; восстановление не начато.'}
-            state = json.loads(state_path.read_text())
+            state, broken = self.load_state(state_path)
+            if broken:
+                return dict(UNREADABLE)
             if ident in state['requests']:
                 return {'ok': True, 'code': 'already_seen', 'text': 'Этот запрос уже принят; повторно не выполняется.'}
             # A new epoch fences any delayed apply that could still reach the Mac.
@@ -177,8 +223,14 @@ class Modes:
             else:
                 state['phase'] = 'recovery_incomplete'
                 state['requests'][ident] = 'outcome_unknown'
-                text = ('Восстановление выполнено не полностью; новые входы заблокированы. '
-                        'Повтори /vpn_recover или проверь сеть вручную.')
+                if 'ambiguous_policy_rule' in result.get('kept', []):
+                    # Repeating cannot help: the kernel could delete the other owner's rule.
+                    text = ('Восстановление выполнено не полностью: найдено чужое правило маршрутизации, '
+                            'неотличимое для ядра от правила шлюза. Оно не удалено; новые входы заблокированы. '
+                            'Нужна проверка оператором, повтор /vpn_recover до неё не поможет.')
+                else:
+                    text = ('Восстановление выполнено не полностью; новые входы заблокированы. '
+                            'Повтори /vpn_recover, когда устройство будет доступно, или проверь сеть вручную.')
             self.persist(state_path, state)
             return {'ok': bool(result.get('ok')), 'code': 'recovered' if result.get('ok') else 'recovery_incomplete',
                     'text': text}

@@ -104,6 +104,11 @@ private chat) or, as root on the gateway host, `modes.py --config <broker-config
   and namespace chains/routes, and removes its own firewall chain last. Global
   forwarding, Docker's shared chains, default routes and foreign entries with the
   same priority or table are retained;
+- a kernel rule delete ignores selectors the request omits, so a policy rule is
+  deleted only when it is the single candidate for that request and matches the
+  attributes recorded at creation. Any other candidate (an extra selector such as
+  fwmark or uidrange, or another protocol) leaves every candidate in place and
+  reports operator reconciliation; activation likewise never deletes and re-adds;
 - the client removes only recorded routes that still point at the recorded
   interface, resolver files whose content is unchanged, the rules and tables of
   its own PF anchor (refusing if the anchor holds foreign rules), and releases its
@@ -112,7 +117,17 @@ private chat) or, as root on the gateway host, `modes.py --config <broker-config
   generation, not the current configuration. A foreign change is kept and reported.
 
 If the client is unreachable, the host keeps the peer blocked and reports
-`recovery_incomplete`; logins stay frozen and recovery can be repeated. When the
+`recovery_incomplete`; logins stay frozen and recovery can be repeated. An
+unreadable or malformed switch state file is never rewritten: status, switching
+and recovery report operator reconciliation without touching credentials,
+sessions or the network.
+
+A configured mode is not an active gateway. Status reports whether the last
+switch left the gateway applied. After recovery, `/vpn_vps` or `/vpn_mac` re-applies
+the gateway network for a session that is already healthy on that host while the
+other host is down: it takes a new epoch and runs preflight, block, activate and
+verify, with no stop, login, credentials or MFA. Otherwise it performs a normal
+switch. Forced reauthentication remains the explicit reconnect command. When the
 gateway host itself is unavailable, the client operator can run the installed
 launcher with `--phase recover --target mac --epoch <current mode epoch>`.
 These withdrawal semantics are verified only on simulated hosts; PF anchor flush
@@ -141,7 +156,8 @@ personal VPN container's lifecycle or reconnect policy merely to prepare this op
 ## Tests
 
 Run the existing Python suite plus `test_gateway.py`, `test_gateway_network.py` and
-`test_gateway_recovery.py`. Synthetic tests cover disabled side-effect freedom, route
+`test_gateway_recovery.py` and `test_gateway_budget.py` (simulators in
+`gateway_fakes.py`). Synthetic tests cover disabled side-effect freedom, route
 rejection, stop-confirm-start order, uncertain-outcome freeze, stale epochs across
 cache eviction and restart, recovery after failure/timeout/disablement with foreign
 state retained, bounded budgets and installer rollback. The recovery tests run the
