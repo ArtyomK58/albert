@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 import tempfile
 import threading
@@ -104,6 +105,37 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(self.notifications,[])
         self.assertTrue(self.broker.handle({'actor':7,'action':'status'})['ok'])
         self.assertEqual(self.targets.calls,[])
+
+    def test_mode_switch_tracks_only_new_owner_for_hour_warning(self):
+        self.config['warning_seconds'] = 3600
+        self.broker.state['sessions']['mac'] = {'started_at': 1, 'warned': False}
+        result = {'ok': True, 'code': 'switched', 'text': 'synthetic success'}
+        with patch('broker.Modes') as modes, patch('broker.time.time', return_value=10000):
+            modes.return_value.switch.return_value = result
+            self.broker.start_mode(self.request(), 'vps')
+            self.wait_job()
+        self.assertEqual(self.broker.state['sessions'], {'vps': {'started_at': 10000, 'warned': False}})
+        self.notifications.clear()
+        due = 10000 + self.config['session_seconds'] - 3600
+        with patch('broker.time.time', return_value=due - 1):
+            self.broker.tick()
+        self.assertEqual(self.notifications, [])
+        with patch('broker.time.time', return_value=due):
+            self.broker.tick()
+            self.broker.tick()
+        self.assertEqual(len(self.notifications), 1)
+        self.assertIn('60', self.notifications[0][0])
+
+    def test_network_restore_or_failure_never_renews_session_lifetime(self):
+        previous = {'vps': {'started_at': 100, 'warned': True}}
+        self.broker.state['sessions'] = previous.copy()
+        for result in ({'ok': True, 'code': 'network_restored', 'text': 'synthetic restored'},
+                       {'ok': False, 'code': 'outcome_unknown', 'text': 'synthetic failure'}):
+            with patch('broker.Modes') as modes:
+                modes.return_value.switch.return_value = result
+                self.broker.start_mode(self.request(), 'vps')
+                self.wait_job()
+            self.assertEqual(self.broker.state['sessions'], previous)
 
     def test_unverified_simultaneous_sessions_never_start(self):
         self.config['simultaneous_verified']=False
@@ -214,6 +246,40 @@ else:
 
 
 class MacTests(unittest.TestCase):
+    def test_network_rpc_is_fixed_fenced_and_never_submits_credentials(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = {'state_file': str(Path(d) / 'requests.json'),
+                 'network_helper': '/Library/PrivilegedHelperTools/FrogVPN/run'}
+            controller = Controller(c)
+            req = {'action': 'network', 'mode_epoch': 5, 'network': {'phase': 'preflight', 'target': 'vps'},
+                   'username': 'unused-user', 'password': 'unused-secret'}
+            with patch('mac_agent.subprocess.run', return_value=subprocess.CompletedProcess([], 0, '{"ok":true}', '')) as run:
+                self.assertTrue(controller.execute(req)['ok'])
+                self.assertEqual(controller.mode_epoch, 0)
+                req['network']['phase'] = 'block'
+                self.assertTrue(controller.execute(req)['ok'])
+                self.assertTrue(controller.execute(req)['ok'])  # A repeated block must run again.
+                self.assertEqual(run.call_count, 3)
+                for call in run.call_args_list:
+                    self.assertEqual(call.args[0][:3], ['/usr/bin/sudo', '-n', c['network_helper']])
+                    self.assertNotIn('input', call.kwargs)
+                    self.assertNotIn('unused-secret', str(call))
+                req['mode_epoch'] = 4
+                self.assertEqual(controller.execute(req)['code'], 'stale_mode_epoch')
+                self.assertEqual(run.call_count, 3)
+            self.assertEqual(Controller(c).mode_epoch, 5)
+
+    def test_network_rpc_rejects_arbitrary_action_or_helper(self):
+        with tempfile.TemporaryDirectory() as d, patch('mac_agent.subprocess.run') as run:
+            c = {'state_file': str(Path(d) / 'requests.json'), 'network_helper': '/tmp/untrusted'}
+            obj = Controller(c)
+            req = {'action': 'network', 'mode_epoch': 1, 'network': {'phase': 'activate', 'target': 'vps'}}
+            self.assertEqual(obj.execute(req)['code'], 'network_helper_unconfigured')
+            c['network_helper'] = '/Library/PrivilegedHelperTools/FrogVPN/run'
+            req['network']['phase'] = 'shell'
+            self.assertEqual(obj.execute(req)['code'], 'invalid_network_request')
+            run.assert_not_called()
+
     def test_local_maintenance_never_mutates_the_native_client(self):
         with tempfile.TemporaryDirectory() as folder:
             controller=Controller({'state_file':folder+'/state.json','maintenance':True})

@@ -9,7 +9,7 @@ import subprocess
 import time
 import urllib.request
 
-from gateway_plan import HOOK_PROCESS_TIMEOUT
+from gateway_plan import HOOK_PROCESS_TIMEOUT, MAC_CALL_TIMEOUT
 
 
 def command(args, timeout=25):
@@ -37,6 +37,14 @@ class Targets:
                 return json.load(response)
         except Exception:
             return {'ok': False, 'state': 'unknown', 'code': 'mac_unavailable'}
+
+    def mac_network(self, phase, target, epoch):
+        body = {'action': 'network', 'mode_epoch': epoch, 'network': {'phase': phase, 'target': target}}
+        request = urllib.request.Request(self.config['mac_url'] + '/control', data=json.dumps(body).encode(),
+                                         headers={'Authorization': 'Bearer ' + self.config['mac_token'],
+                                                  'Content-Type': 'application/json'})
+        with urllib.request.urlopen(request, timeout=MAC_CALL_TIMEOUT) as response:
+            return json.load(response)
 
     def vps_status(self):
         try:

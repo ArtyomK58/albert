@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 import subprocess
 import threading
+from gateway_plan import MAC_HELPER_BUDGET
 
 
 class Controller:
@@ -28,6 +29,8 @@ class Controller:
 
     def execute(self, request):
         action = request.get('action')
+        if action == 'network':
+            return self.network(request)
         if action not in ('status', 'connect', 'reconnect', 'disconnect'):
             return {'ok': False, 'code': 'invalid_action'}
         if action != 'status' and self.config.get('maintenance'):
@@ -98,6 +101,46 @@ class Controller:
         finally:
             if action != 'status':
                 self.lock.release()
+
+    def network(self, request):
+        """Fixed root helper only. No login, credential handling or shell RPC."""
+        value = request.get('network', {})
+        if not isinstance(value, dict):
+            return {'ok': False, 'code': 'invalid_network_request'}
+        phase, target, epoch = value.get('phase'), value.get('target'), request.get('mode_epoch')
+        if (phase not in ('preflight', 'block', 'activate', 'verify', 'recover')
+                or target not in ('mac', 'vps') or type(epoch) is not int or epoch < 1):
+            return {'ok': False, 'code': 'invalid_network_request'}
+        if self.config.get('maintenance') and phase != 'recover':
+            return {'ok': False, 'code': 'maintenance'}
+        if self.config.get('network_helper') != '/Library/PrivilegedHelperTools/FrogVPN/run':
+            return {'ok': False, 'code': 'network_helper_unconfigured'}
+        if not self.lock.acquire(blocking=False):
+            return {'ok': False, 'code': 'busy'}
+        try:
+            if epoch < self.mode_epoch:
+                return {'ok': False, 'code': 'stale_mode_epoch'}
+            if phase not in ('preflight', 'verify') and epoch > self.mode_epoch:
+                self.mode_epoch = epoch
+                self.persist_epoch()
+            # Network phases are idempotent and never authenticate. A repeated block
+            # must execute after a failed activation, rather than reuse a cached reply.
+            proc = subprocess.run(['/usr/bin/sudo', '-n', self.config['network_helper'],
+                                   '--phase', phase, '--target', target, '--epoch', str(epoch)],
+                                  capture_output=True, text=True, timeout=MAC_HELPER_BUDGET + 15)
+            result = json.loads(proc.stdout)
+            if proc.returncode == 0 and result.get('ok') and phase == 'activate':
+                # A failed DNS lookup during MFA can remain cached after routing
+                # returns. Refresh only resolver caches, never restart a VPN.
+                subprocess.run(['/usr/bin/dscacheutil', '-flushcache'], capture_output=True,
+                               timeout=8, check=True)
+            return {'ok': proc.returncode == 0 and result.get('ok') is True,
+                    'code': str(result.get('code', ''))[:64],
+                    'kept': [str(x)[:64] for x in result.get('kept', [])[:32]]}
+        except Exception:
+            return {'ok': False, 'code': 'network_helper_outcome_unknown'}
+        finally:
+            self.lock.release()
 
     def persist_epoch(self):
         self.epoch_path.parent.mkdir(parents=True, exist_ok=True)

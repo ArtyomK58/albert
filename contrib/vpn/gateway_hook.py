@@ -102,6 +102,17 @@ class NetworkHook:
         self.chain([], 'filter', HOST_CHAIN, 'DOCKER-USER', rules, reserve)
 
     def mac(self, phase, target, epoch):
+        if self.c.get('mac_rpc_config'):
+            from targets import Targets
+            path = Path(self.c['mac_rpc_config'])
+            st = path.stat()
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                raise RuntimeError('mac_rpc_config_not_operator_owned')
+            self.deadline.admit(MAC_CALL_TIMEOUT, HOST_FAILSAFE_RESERVE)
+            result = Targets(json.loads(path.read_text())).mac_network(phase, target, epoch)
+            if result.get('ok') is not True:
+                raise RuntimeError('mac_network_not_verified')
+            return result
         argv = self.c.get('mac_command', [])
         if not argv or not all(isinstance(x, str) for x in argv):
             raise RuntimeError('mac_privileged_helper_unconfigured')
@@ -193,6 +204,9 @@ class NetworkHook:
                         for n in (data.get('Peer') or {}).values())
             route = self.ip_json(['ip', '-j', 'route', 'get', peer])
             found = found and bool(route) and route[0].get('dev') == s['host_bridge']
+            prefs = json.loads(self.command(['tailscale', 'debug', 'prefs']).stdout)
+            if not set(s['corporate_prefixes']).issubset(prefs.get('AdvertiseRoutes') or []):
+                raise RuntimeError('tailnet_corporate_routes_not_advertised')
         else:
             data = json.loads(self.command(['docker', 'inspect', s['container']]).stdout)[0]
             found = any(n.get('IPAddress') == s['container_address'] and n.get('MacAddress', '').lower() == s['container_mac'].lower()
@@ -209,8 +223,11 @@ class NetworkHook:
                 raise RuntimeError('routing_resource_already_owned')
             if self.ip_json(['ip', '-j', 'route', 'show', 'table', str(s['table'])]):
                 raise RuntimeError('routing_table_already_owned')
-            if tailnet and TailnetGuard(self).inspect(HOST_FAILSAFE_RESERVE) is not None:
-                raise RuntimeError('firewall_resource_already_owned')
+            if tailnet:
+                guard = TailnetGuard(self)
+                current = guard.inspect(HOST_FAILSAFE_RESERVE)
+                if current is not None and not (self.c.get('retain_blocked_guard') and guard.owned(current)):
+                    raise RuntimeError('firewall_resource_already_owned')
             if not tailnet and self.command(['iptables', '-S', HOST_CHAIN], check=False).returncode == 0:
                 raise RuntimeError('firewall_resource_already_owned')
             if not tailnet and self.return_route()[0]:

@@ -107,8 +107,9 @@ class Modes:
             # A healthy session on the chosen host needs no login; only its network may be missing.
             network_only = live[target]['state'] == 'connected' and live[source]['state'] == 'disconnected' and not force
             if network_only and state.get('phase') == 'ready' and state.get('mode') == target:
-                return {'ok': True, 'code': 'already_connected',
-                        'text': 'VPN и маршрутизация шлюза уже применены для ' + ('VPS.' if target == 'vps' else 'Mac.')}
+                if self.targets.mode_hook('verify', target).get('ok'):
+                    return {'ok': True, 'code': 'already_connected',
+                            'text': 'VPN и маршрутизация шлюза уже применены для ' + ('VPS.' if target == 'vps' else 'Mac.')}
             if not self.targets.mode_hook('preflight', target).get('ok'):
                 return {'ok': False, 'code': 'network_preflight_failed', 'text': 'Сетевые настройки режима ещё не прошли проверку.'}
             if not network_only:

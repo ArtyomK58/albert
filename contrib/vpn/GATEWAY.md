@@ -169,12 +169,21 @@ native helper without executing it. No live login is part of preparation.
 `transport: tailnet` selects a single CGNAT `/32` peer and verifies its configured
 stable node ID against the live overlay status. The host return route remains
 owned by the overlay. Docker NAT exemptions are not used in this mode.
+Corporate prefixes must be explicitly advertised by the overlay; its default
+exit route excludes private address ranges. This is checked before authentication.
+Install the blocked boot guard before offering these prefixes, and retain the
+ordinary exit routes. Other peers remain denied by the early forwarding guard.
 
 The owned nftables guard runs before the overlay's forwarding accepts. Its
 postrouting filter removes only the overlay NAT mark for the approved peer and
 corporate destinations, preserving source identity inside the VPN namespace.
 Shared overlay chains are never flushed or replaced. Recovery requires the
 recorded semantic digest of the owned nftables table.
+When `guard_state` and `retain_blocked_guard` are configured, the boot guard has
+its own durable receipt. Mode recovery leaves it blocked while withdrawing
+session routing; advertised private subnets cannot fall back to the public WAN.
+Subnet-route approval and overlay-owned Mac routes require operator review;
+the helper refuses existing exact routes instead of claiming another owner's route.
 
 The Mac helper blocks corporate IPv4 and global/ULA IPv6 outside the selected
 tunnel. Operator-owned scoped DNS must remain present during authentication and

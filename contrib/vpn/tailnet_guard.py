@@ -1,6 +1,7 @@
 """Owned early nftables guard, evaluated before another overlay's filter accept."""
 import hashlib
 import json
+from pathlib import Path
 
 
 TABLE = 'frog_corp_guard'
@@ -19,6 +20,30 @@ def digest(value):
 class TailnetGuard:
     def __init__(self, parent):
         self.parent = parent
+
+    def receipt(self):
+        path = self.parent.c.get('guard_state')
+        value = (json.loads(Path(path).read_text()) if path and Path(path).exists()
+                 else self.parent.owner() or {})
+        if value and value.get('signature') != digest(self.parent.spec):
+            raise RuntimeError('tailnet_guard_spec_requires_operator')
+        return value
+
+    def owned(self, current):
+        return current is not None and digest(current) == self.receipt().get('tailnet_guard_digest')
+
+    def save_receipt(self, value):
+        owner = self.parent.owner()
+        owner['tailnet_guard_digest'] = digest(value)
+        self.parent.save_owner(owner)
+        path = self.parent.c.get('guard_state')
+        if path:
+            path = Path(path)
+            temp = path.with_suffix('.new')
+            temp.write_text(json.dumps({'signature': digest(self.parent.spec),
+                                        'tailnet_guard_digest': digest(value)}))
+            temp.chmod(0o600)
+            temp.replace(path)
 
     def inspect(self, reserve):
         r = self.parent.command(['nft', '-s', '-j', 'list', 'table', 'inet', TABLE], check=False, reserve=reserve)
@@ -63,7 +88,7 @@ class TailnetGuard:
     def apply(self, active, reserve):
         owner = self.parent.owner() or {}
         current = self.inspect(reserve)
-        if current is not None and digest(current) != owner.get('tailnet_guard_digest'):
+        if current is not None and not self.owned(current):
             raise RuntimeError('foreign_tailnet_guard_requires_operator')
         if active and current is None:
             raise RuntimeError('tailnet_guard_must_be_blocked_before_activation')
@@ -73,16 +98,20 @@ class TailnetGuard:
         value = self.inspect(reserve)
         if value is None:
             raise RuntimeError('tailnet_guard_creation_unverified')
-        owner = self.parent.owner()
-        owner['tailnet_guard_digest'] = digest(value)
-        self.parent.save_owner(owner)
+        self.save_receipt(value)
 
     def remove(self, reserve):
+        if self.parent.c.get('retain_blocked_guard'):
+            # The boot service keeps its own receipt after mode resources are
+            # withdrawn. Advertised subnets must never fall back to ordinary WAN.
+            return self.apply(False, reserve)
         current = self.inspect(reserve)
         if current is None:
             return
-        if digest(current) != (self.parent.owner() or {}).get('tailnet_guard_digest'):
+        if not self.owned(current):
             raise RuntimeError('foreign_tailnet_guard_requires_operator')
         self.parent.command(['nft', 'delete', 'table', 'inet', TABLE], reserve=reserve)
         if self.inspect(reserve) is not None:
             raise RuntimeError('tailnet_guard_withdrawal_unverified')
+        if self.parent.c.get('guard_state'):
+            Path(self.parent.c['guard_state']).unlink(missing_ok=True)

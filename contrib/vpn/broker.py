@@ -61,7 +61,7 @@ class Broker:
         lines = ['VPN']
         labels = {'connected': 'подключён', 'disconnected': 'не подключён',
                   'connecting': 'подключается', 'disconnecting': 'отключается', 'unknown': 'нет связи'}
-        for host, label in [('vps', 'VPS'), ('mac', 'Mac')]:
+        for host, label in [('vps', 'VPS'), ('mac', 'Mac (локальная сессия)' if self.config.get('gateway_option') else 'Mac')]:
             state = statuses[host].get('state', 'unknown')
             text = label + ': ' + labels.get(state, 'нет связи')
             session = self.state['sessions'].get(host, {})
@@ -163,10 +163,15 @@ class Broker:
             return {'ok': False, 'text': 'Переключение VPN уже выполняется.'}
 
         def work():
+            started_at = time.time()  # Conservative lifetime: includes authentication/verification.
             try:
                 try:
                     result = Modes(self.config, self.targets, self.credentials).switch(
                         target, request.get('request_id'), force)
+                    if result.get('ok') and result.get('code') == 'switched':
+                        with self.state_lock:
+                            self.state['sessions'] = {target: {'started_at': started_at, 'warned': False}}
+                            self.persist()
                 except Exception:
                     result = {'text': 'Переключение VPN не подтверждено из-за внутренней ошибки. '
                                       'Повторный вход и MFA не запускались; проверь /vpn_mode.'}
@@ -175,7 +180,7 @@ class Broker:
                 self.lock.release()
 
         threading.Thread(target=work, daemon=True).start()
-        return {'ok': True, 'text': 'Начато переключение одной VPN-сессии. Подтверди MFA, когда появится запрос.'}
+        return {'ok': True, 'text': 'Проверяю VPN и маршруты. Если потребуется новый вход, подтверди появившийся запрос MFA.'}
 
     def start_recover(self, request):
         if not self.lock.acquire(blocking=False):
@@ -259,7 +264,7 @@ class Broker:
         if self.config.get('maintenance'):
             return
         now = time.time()
-        for host, session in self.state['sessions'].items():
+        for host, session in list(self.state['sessions'].items()):
             if not session.get('warned') and now >= session['started_at'] + self.config['session_seconds'] - self.config['warning_seconds']:
                 remaining = max(0, int((session['started_at'] + self.config['session_seconds'] - now) / 60))
                 # Persist before delivery. An unknown Telegram outcome must not

@@ -260,7 +260,7 @@ class FollowUpTests(unittest.TestCase):
         self.assertTrue(w.modes().status()['gateway']['active'])
         events = len(w.targets.events)
         self.assertEqual(self.switch('vps', 'vpn:123456789:103')['code'], 'already_connected')
-        self.assertEqual([e for e in w.targets.events[events:] if e != 'snapshot'], [])
+        self.assertEqual([e for e in w.targets.events[events:] if e != 'snapshot'], ['verify'])
         self.assertEqual(self.switch('vps', 'vpn:123456789:102')['code'], 'already_seen')
 
     def test_reapply_freezes_if_the_session_drops_and_reconnect_stays_an_explicit_login(self):
