@@ -10,8 +10,9 @@ from urllib.request import Request, urlopen
 
 from broker import Broker
 from mac_agent import Controller
-from targets import validate_credentials
+from targets import Targets, validate_credentials
 from enrollment import start_web
+from auth_failure import auth_failure_code
 
 
 class Store:
@@ -34,7 +35,7 @@ class FakeTargets:
     def vps_status(self):
         return {'ok': True, 'state': 'connected'}
 
-    def vps_login(self, credentials, force):
+    def vps_login(self, credentials, force, on_pending=None):
         self.calls.append(('vps', force))
         self.gate.wait(2)
         return {'ok': True, 'state': 'connected', 'changed': True}
@@ -53,6 +54,7 @@ class BrokerTests(unittest.TestCase):
         self.config = {'owner_id': 7, 'state_file': self.tmp.name + '/state.json',
                        'public_url': 'https://vpn.example.com', 'session_seconds': 43200,
                        'warning_seconds': 1800, 'telegram_token_env': 'UNSET_TEST_TOKEN'}
+        self.config.update(verification_delay_seconds=0,simultaneous_verified=True)
         self.broker = Broker(self.config, self.targets, self.store)
         self.notifications = []
         self.broker.notify = lambda text, setup_url=None: self.notifications.append((text, setup_url)) or True
@@ -93,6 +95,32 @@ class BrokerTests(unittest.TestCase):
         self.assertFalse(self.broker.handle(self.request())['ok'])
         self.assertEqual(self.targets.calls, [])
 
+    def test_incident_maintenance_blocks_actions_and_alerts(self):
+        self.config['maintenance']=True
+        self.assertFalse(self.broker.handle(self.request())['ok'])
+        self.broker.state['sessions']['mac']={'started_at':0,'warned':False}
+        self.broker.tick()
+        self.assertEqual(self.targets.calls,[])
+        self.assertEqual(self.notifications,[])
+
+    def test_unverified_simultaneous_sessions_never_start(self):
+        self.config['simultaneous_verified']=False
+        self.assertFalse(self.broker.handle(self.request())['ok'])
+        self.assertEqual(self.targets.calls,[])
+
+    def test_connect_does_not_chase_a_peer_dropped_by_the_first_login(self):
+        class Conflict(FakeTargets):
+            def vps_status(self):return {'ok':True,'state':'connected' if self.calls else 'disconnected'}
+            def vps_login(self,credentials,force,on_pending=None):
+                self.calls.append(('vps',force));return {'ok':True,'state':'connected','changed':True}
+            def mac(self,action,credentials=None,request_id=None):
+                if action!='status':self.calls.append(('mac',action))
+                return {'ok':True,'state':'disconnected' if self.calls else 'connected'}
+        target=Conflict();self.broker.targets=target
+        request=self.request();request['action']='connect'
+        self.broker.handle(request);self.wait_job()
+        self.assertEqual(target.calls,[('vps',False)])
+
     def test_one_time_enrollment_expires_and_is_consumed_only_after_save(self):
         self.broker.setup()
         token = self.notifications[-1][1].split('#')[1]
@@ -128,8 +156,73 @@ class BrokerTests(unittest.TestCase):
                       {'username': 'user', 'password': ''}]:
             with self.assertRaises(ValueError): validate_credentials(value)
 
+    def test_target_subset_does_not_restart_the_other_device(self):
+        request=self.request();request['targets']=['vps']
+        self.broker.handle(request);self.wait_job()
+        self.assertEqual(self.targets.calls,[('vps',True)])
+
+    def test_second_login_cannot_hide_a_dropped_first_connection(self):
+        class Dropped(FakeTargets):
+            def vps_status(self):
+                return {'ok': True, 'state': 'disconnected' if any(c[0]=='mac' for c in self.calls) else 'connected'}
+        self.broker.targets = Dropped()
+        self.broker.handle(self.request())
+        self.wait_job()
+        result = self.broker.state['requests']['request-one']['results']['vps']
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['code'], 'connection_not_retained')
+        self.assertNotIn('vps', self.broker.state['sessions'])
+
+
+class TerminalTests(unittest.TestCase):
+    def test_instruction_mentions_success_before_credentials_and_must_not_end_login(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script=Path(folder)/'supervisor'
+            script.write_text('''#!/usr/bin/env python3
+import sys
+from pathlib import Path
+flag=Path(__file__).with_name('connected')
+if sys.argv[1]=='stop':
+    if flag.exists():flag.unlink()
+elif sys.argv[1]=='status':
+    print('OK state=up owned=yes tcp=estab' if flag.exists() else 'OK state=down owned=no tcp=none')
+else:
+    print('After Initialization Sequence Completed, this terminal may close.',flush=True)
+    user=input('Enter Auth Username:')
+    password=input('Enter Auth Password:')
+    if user=='fixture-user' and password=='fixture-password':
+        print('AUTH_PENDING',flush=True)
+        flag.touch()
+        print('Initialization Sequence Completed',flush=True)
+''')
+            script.chmod(0o700)
+            result=Targets({'vps_command':str(script),'auth_timeout_seconds':3}).vps_login(
+                {'username':'fixture-user','password':'fixture-password'},True)
+            self.assertTrue(result['ok'])
+            self.assertTrue(result['mfa_observed'])
+
+    def test_authentication_reason_tags_never_include_response_or_credentials(self):
+        samples=[(b'AUTH_FAILED,Maximum concurrent sessions exceeded','auth-session-limit'),
+                 (b'AUTH_FAILED,Username/password verification failed fixture-secret','auth-credentials-rejected'),
+                 (b'AUTH_FAILED,MFA timed out','auth-mfa-timeout'),
+                 (b'AUTH_FAILED,Data channel cipher negotiation failed','auth-cipher-negotiation'),
+                 (b'AUTH_FAILED,opaque token fixture-secret','auth-failure')]
+        for line,expected in samples:
+            self.assertEqual(auth_failure_code(line),expected)
+
 
 class MacTests(unittest.TestCase):
+    def test_changed_saved_credentials_are_refused_before_disconnect(self):
+        with tempfile.TemporaryDirectory() as folder:
+            controller=Controller({'state_file':folder+'/state.json','network_binary':'/unused',
+                                   'service_id':'fixture','use_saved_credentials':True,
+                                   'token':'fixture-control-token','credentials_digest':'previous'})
+            with patch('mac_agent.subprocess.run') as run:
+                result=controller.execute({'action':'reconnect','request_id':'fixture-rotation',
+                                           'username':'fixture','password':'fixture-secret'})
+                self.assertEqual(result['code'],'native_credential_update_required')
+                run.assert_not_called()
+
     def test_credentials_travel_only_on_stdin_and_are_absent_from_response(self):
         with tempfile.TemporaryDirectory() as folder:
             controller = Controller({'state_file': folder+'/state.json', 'network_binary': '/unused',

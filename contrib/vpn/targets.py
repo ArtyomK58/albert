@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import subprocess
 import time
@@ -28,7 +29,7 @@ class Targets:
             headers={'Authorization': 'Bearer ' + self.config['mac_token'],
                      'Content-Type': 'application/json'})
         try:
-            with urllib.request.urlopen(request, timeout=155 if action != 'status' else 8) as response:
+            with urllib.request.urlopen(request, timeout=self.config.get('auth_timeout_seconds', 360)+45 if action != 'status' else 8) as response:
                 return json.load(response)
         except Exception:
             return {'ok': False, 'state': 'unknown', 'code': 'mac_unavailable'}
@@ -41,7 +42,7 @@ class Targets:
         except (OSError, subprocess.TimeoutExpired):
             return {'ok': False, 'state': 'unknown', 'code': 'vps_unavailable'}
 
-    def vps_login(self, credentials, force):
+    def vps_login(self, credentials, force, on_pending=None):
         if not force and self.vps_status().get('state') == 'connected':
             return {'ok': True, 'state': 'connected', 'changed': False}
         binary = self.config['vps_command']
@@ -55,9 +56,9 @@ class Targets:
         os.close(slave)
         buffer = b''
         sent = set()
-        success = False
         mfa = False
-        end = time.monotonic() + 150
+        started = time.monotonic()
+        end = started + self.config.get('auth_timeout_seconds', 360)
         try:
             while time.monotonic() < end:
                 if not select.select([master], [], [], 0.25)[0]:
@@ -76,18 +77,23 @@ class Targets:
                     if prompt in buffer and key not in sent:
                         os.write(master, credentials[key].encode() + b'\n')
                         sent.add(key)
-                if b'AUTH_PENDING' in buffer or b'extending handshake timeout' in buffer:
+                if not mfa and b'AUTH_PENDING' in buffer:
                     mfa = True
-                marker = self.config.get('completion_marker', '').encode()
-                if b'Initialization Sequence Completed' in buffer or (marker and marker in buffer):
-                    success = True
-                    break
+                    if on_pending:
+                        on_pending()
                 if b'AUTH_FAILED' in buffer or b'auth-not-completed' in buffer:
                     break
-            if success and self.vps_status().get('state') == 'connected':
+            # Human instructions can mention a success line before authentication.
+            # Only the independent transport check establishes actual completion.
+            if self.vps_status().get('state') == 'connected':
                 return {'ok': True, 'state': 'connected', 'changed': True, 'mfa_observed': mfa}
-            return {'ok': False, 'state': self.vps_status().get('state', 'unknown'),
-                    'code': 'authentication_or_network_timeout'}
+            status = command([binary, 'status']).stdout
+            reason = re.search(r'\breason=([a-z-]+)', status)
+            return {'ok': False, 'state': 'disconnected',
+                    'code': reason.group(1) if reason else 'authentication_or_network_timeout',
+                    'credentials_submitted': len(sent) == 2, 'mfa_observed': mfa,
+                    'elapsed_seconds': round(time.monotonic()-started),
+                    'controller_timeout': time.monotonic() >= end}
         finally:
             os.close(master)
             if proc.poll() is None:

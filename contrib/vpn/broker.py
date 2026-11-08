@@ -44,7 +44,7 @@ class Broker:
         if not token:
             return False
         payload = {'chat_id': self.config['owner_id'], 'text': text,
-                   'reply_markup': {'keyboard': [['Переподключись'], ['Статус VPN']], 'resize_keyboard': True}}
+                   'reply_markup': {'keyboard': [['Подключись', 'Переподключись'], ['Статус VPN']], 'resize_keyboard': True}}
         if setup_url:
             payload['reply_markup'] = {'inline_keyboard': [[{'text': 'Ввести реквизиты VPN', 'url': setup_url}]]}
         request = urllib.request.Request('https://api.telegram.org/bot' + token + '/sendMessage',
@@ -100,6 +100,9 @@ class Broker:
         # This field is supplied only by the deterministic host adapter.
         if str(request.get('actor')) != str(self.config['owner_id']):
             return {'ok': False, 'text': 'Управление VPN доступно только владельцу.'}
+        if self.config.get('maintenance'):
+            return {'ok': False, 'text': self.config.get('maintenance_message',
+                    'Автоматическое управление VPN временно приостановлено для проверки устойчивости. Используй штатный клиент OpenVPN.')}
         action = request.get('action')
         if action == 'status':
             return self.status()
@@ -107,6 +110,12 @@ class Broker:
             return self.setup()
         if action not in ('connect', 'reconnect'):
             return {'ok': False, 'text': 'Неизвестная команда VPN.'}
+        if not self.config.get('simultaneous_verified'):
+            return {'ok': False, 'text': 'Одновременное подключение Mac и VPS ещё не проверено. Автоматический вход заблокирован до проверки устойчивости.'}
+        hosts = request.get('targets', ['vps', 'mac'])
+        if not isinstance(hosts, list) or not hosts or any(host not in ('vps', 'mac') for host in hosts):
+            return {'ok': False, 'text': 'Неизвестное устройство VPN.'}
+        hosts = [host for host in ['vps', 'mac'] if host in hosts]
         ident = request.get('request_id', '')
         if not isinstance(ident, str) or not 8 <= len(ident) <= 128:
             return {'ok': False, 'text': 'Не удалось определить запрос.'}
@@ -119,21 +128,30 @@ class Broker:
             return {'ok': True, 'text': 'Подключение уже выполняется. Подтверди текущий запрос MFA.'}
         self.state['requests'][ident] = {'state': 'running', 'started_at': time.time()}
         self.persist()
-        threading.Thread(target=self.job, args=(ident, action, credentials), daemon=True).start()
-        return {'ok': True, 'text': 'Запускаю VPN на VPS и Mac. Подтверди запросы в Multifactor; пришлю результат для обоих устройств.'}
+        threading.Thread(target=self.job, args=(ident, action, credentials, hosts), daemon=True).start()
+        devices = 'VPS и Mac' if len(hosts)==2 else ('VPS' if hosts[0]=='vps' else 'Mac')
+        return {'ok': True, 'text': f'Запускаю VPN на {devices}. Подтверди запросы в Multifactor; пришлю результат.'}
 
-    def job(self, ident, action, credentials):
+    def job(self, ident, action, credentials, hosts):
         result = {}
         try:
+            initial = {'vps': self.targets.vps_status(), 'mac': self.targets.mac('status')}
+            if 'vps' not in hosts:
+                result['vps'] = dict(self.targets.vps_status(), changed=False)
+            if 'mac' not in hosts:
+                result['mac'] = dict(self.targets.mac('status'), changed=False)
             for host in ['vps', 'mac']:
+                if host not in hosts:
+                    continue
                 if action == 'connect':
-                    current = self.targets.vps_status() if host == 'vps' else self.targets.mac('status')
+                    current = initial[host]
                     if current.get('ok') and current.get('state') == 'connected':
                         result[host] = dict(current, changed=False)
                         continue
                 self.notify(f'VPN {"VPS" if host == "vps" else "Mac"}: начинается вход. Подтверди запрос Multifactor, когда он появится.')
                 try:
-                    value = (self.targets.vps_login(credentials, action == 'reconnect') if host == 'vps'
+                    value = (self.targets.vps_login(credentials, action == 'reconnect',
+                             on_pending=lambda: self.notify('VPN VPS: началась проверка входа. Подтверди запрос Multifactor сразу после появления — позднее подтверждение сервер может отклонить.')) if host == 'vps'
                              else self.targets.mac(action, credentials, ident + ':mac'))
                 except Exception:
                     value = {'ok': False, 'state': 'unknown', 'code': 'controller_unavailable'}
@@ -141,12 +159,33 @@ class Broker:
                 if value.get('ok') and value.get('state') == 'connected' and value.get('changed'):
                     self.state['sessions'][host] = {'started_at': time.time(), 'warned': False}
                     self.persist()
+            for _ in range(2):
+                live = {'vps': self.targets.vps_status(), 'mac': self.targets.mac('status')}
+                for host in ['vps', 'mac']:
+                    result[host]['verified_state'] = live[host].get('state', 'unknown')
+                    if not live[host].get('ok') or live[host].get('state') != 'connected':
+                        if result[host].get('ok'):
+                            result[host]['code'] = 'connection_not_retained'
+                        result[host].update(ok=False, state=live[host].get('state', 'unknown'))
+                        self.state['sessions'].pop(host, None)
+                    elif result[host].get('code') == 'authentication_or_network_timeout':
+                        result[host].update(ok=True, state='connected', code='connected_after_status_refresh')
+                if _ == 0:
+                    time.sleep(self.config.get('verification_delay_seconds', 1))
             self.state['requests'][ident].update(state='done', results=result)
             self.persist()
             lines = ['VPN: результат']
+            reasons = {'auth-mfa-timeout': 'подтверждение MFA не получено вовремя',
+                       'auth-credentials-rejected': 'сервер отклонил аутентификацию',
+                       'auth-session-limit': 'сервер ограничил число одновременных подключений',
+                       'auth-client-policy': 'сервер отклонил тип или версию клиента',
+                       'auth-account-locked': 'сервер сообщил о блокировке учётной записи',
+                       'auth-cipher-negotiation': 'не согласованы параметры шифрования',
+                       'native_credential_update_required': 'нужно один раз обновить сохранённые реквизиты на Mac'}
             for host, label in [('vps', 'VPS'), ('mac', 'Mac')]:
                 value = result[host]
-                lines.append(label + ': ' + ('подключён' if value.get('ok') and value.get('state') == 'connected' else 'вход не подтверждён или устройство недоступно'))
+                lines.append(label + ': ' + ('подключён' if value.get('ok') and value.get('state') == 'connected'
+                             else reasons.get(value.get('code'), 'вход не подтверждён или устройство недоступно')))
             self.notify('\n'.join(lines))
         finally:
             # Only metadata survives; credentials remain in this worker's memory.
@@ -154,6 +193,8 @@ class Broker:
             self.lock.release()
 
     def tick(self):
+        if self.config.get('maintenance'):
+            return
         now = time.time()
         for host, session in self.state['sessions'].items():
             if not session.get('warned') and now >= session['started_at'] + self.config['session_seconds'] - self.config['warning_seconds']:

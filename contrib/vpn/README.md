@@ -26,8 +26,8 @@ the Git tree. `broker.py --config <private-config>` and `mac_agent.py --config
 `swiftc network.swift -o <private-install-dir>/network-control`.
 
 The broker configuration supplies `owner_id`, `client_uid`, `client_gid`,
-`socket`, `state_file`, `credential_file`, `vps_command`, an optional supervisor
-`completion_marker`, `mac_url`, `mac_token`, `public_url`, `web_port`,
+`socket`, `state_file`, `credential_file`, `vps_command`,
+`mac_url`, `mac_token`, `public_url`, `web_port`,
 `session_seconds`, `warning_seconds`, and the environment-variable name
 `telegram_token_env`. Grant the socket only to the runtime's UID; scripts should
 run under a different UID. Mount the socket directory and set
@@ -37,7 +37,29 @@ The Mac configuration supplies its loopback `port`, shared `token`, fixed
 `service_id`, `state_file`, and compiled `network_binary`. Reach it only through
 an authenticated encrypted transport, such as a loopback SSH reverse forward.
 The provider must accept standard credential overrides or already have its
-credentials saved. Validate this with an attended MFA login before acceptance.
+credentials saved. For a provider that ignores overrides, save the credentials
+once through its native client and enable `use_saved_credentials`. Set
+`credentials_digest` to HMAC-SHA256(control token, canonical UTF-8 JSON of
+username/password, sorted keys, compact separators). A changed credential is
+refused before disconnecting a working session; update the native client once
+when rotating that credential. `client_app` optionally launches the existing
+client in the background. Validate with an attended MFA login before acceptance.
+
+`auth_timeout_seconds` controls the observer wait (default six minutes); it does
+not extend or bypass the server's MFA deadline. Approve challenges promptly.
+The supervisor may use `auth_failure.py` to classify private responses into
+fixed diagnostic tags without exposing raw authentication data. Its own route,
+namespace, session ownership and secret filtering protections must be retained.
+Create the runtime socket directory early at boot before starting a container
+that bind-mounts it.
+
+Set `maintenance` to block control requests and notifications during an incident;
+`maintenance_message` explains this state without attempting another login.
+The operator must set `simultaneous_verified` only after an attended sustained
+test; login is fail-closed before that gate is satisfied.
+Validate simultaneous sessions over a sustained observation period. Some servers
+do not permit two connections using the same user/profile. Do not automatically
+chase a peer that disconnects when the other peer connects.
 
 ## Authentication and delivery
 

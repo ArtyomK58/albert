@@ -7,6 +7,7 @@ struct Request: Decodable {
     let service_id: String
     let username: String?
     let password: String?
+    let timeout_seconds: Int?
 }
 
 func reply(_ value: [String: Any]) {
@@ -24,7 +25,8 @@ do {
         throw NSError(domain: "service_unavailable", code: 1)
     }
     func status() -> String {
-        switch SCNetworkConnectionGetStatus(connection) {
+        guard let probe = SCNetworkConnectionCreateWithServiceID(nil, request.service_id as CFString, nil, nil) else { return "unavailable" }
+        switch SCNetworkConnectionGetStatus(probe) {
         case .connected: return "connected"
         case .connecting: return "connecting"
         case .disconnecting: return "disconnecting"
@@ -53,7 +55,7 @@ do {
             guard SCNetworkConnectionStart(connection, options.isEmpty ? nil : options as CFDictionary, true) else {
                 throw NSError(domain: "start_rejected", code: Int(SCError()))
             }
-            let end = Date().addingTimeInterval(120)
+            let end = Date().addingTimeInterval(Double(min(600, max(30, request.timeout_seconds ?? 360))))
             var connected = false
             while Date() < end {
                 Thread.sleep(forTimeInterval: 0.5)
