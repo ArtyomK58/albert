@@ -44,6 +44,9 @@ username/password, sorted keys, compact separators). A changed credential is
 refused before disconnecting a working session; update the native client once
 when rotating that credential. `client_app` optionally launches the existing
 client in the background. Validate with an attended MFA login before acceptance.
+Set `core_log_file` to the provider's connection log when OS tunnel status can
+remain connected during transport resets. Only fixed event names are returned;
+raw logs and session tokens never enter responses.
 
 `auth_timeout_seconds` controls the observer wait (default six minutes); it does
 not extend or bypass the server's MFA deadline. Approve challenges promptly.

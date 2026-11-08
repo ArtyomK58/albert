@@ -212,6 +212,24 @@ else:
 
 
 class MacTests(unittest.TestCase):
+    def test_local_maintenance_never_mutates_the_native_client(self):
+        with tempfile.TemporaryDirectory() as folder:
+            controller=Controller({'state_file':folder+'/state.json','maintenance':True})
+            with patch('mac_agent.subprocess.run') as run:
+                self.assertEqual(controller.execute({'action':'reconnect'})['code'],'maintenance')
+                run.assert_not_called()
+
+    def test_os_tunnel_does_not_hide_reconnecting_vpn_transport(self):
+        with tempfile.TemporaryDirectory() as folder:
+            log=Path(folder)/'core.log'
+            log.write_text('EVENT: CONNECTED\nSession token: fixture-secret\nEVENT: TRANSPORT_ERROR\nEVENT: RECONNECTING\n')
+            controller=Controller({'state_file':folder+'/state.json','network_binary':'/unused',
+                                   'service_id':'fixture','core_log_file':str(log)})
+            with patch('mac_agent.subprocess.run') as run:
+                run.return_value.stdout='{"ok":true,"state":"connected"}'
+                result=controller.execute({'action':'status'})
+                self.assertEqual(result['state'],'connecting')
+                self.assertNotIn('fixture-secret',json.dumps(result))
     def test_changed_saved_credentials_are_refused_before_disconnect(self):
         with tempfile.TemporaryDirectory() as folder:
             controller=Controller({'state_file':folder+'/state.json','network_binary':'/unused',

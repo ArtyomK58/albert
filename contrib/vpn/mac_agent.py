@@ -4,6 +4,7 @@ import hmac
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import re
 from pathlib import Path
 import subprocess
 import threading
@@ -20,6 +21,8 @@ class Controller:
         action = request.get('action')
         if action not in ('status', 'connect', 'reconnect'):
             return {'ok': False, 'code': 'invalid_action'}
+        if action != 'status' and self.config.get('maintenance'):
+            return {'ok': False, 'code': 'maintenance'}
         if action != 'status':
             ident = request.get('request_id', '')
             if not isinstance(ident, str) or not 8 <= len(ident) <= 100:
@@ -54,6 +57,18 @@ class Controller:
                                      timeout=self.config.get('auth_timeout_seconds', 360)+25)
             result = json.loads(process.stdout)
             result = {k: v for k, v in result.items() if k in ('ok', 'state', 'code', 'changed')}
+            # NetworkExtension may keep its tunnel up while the VPN transport
+            # repeatedly resets. Report the provider's real connection events.
+            if result.get('state') == 'connected' and self.config.get('core_log_file'):
+                log = Path(self.config['core_log_file'])
+                if log.exists():
+                    with log.open('rb') as source:
+                        source.seek(max(0, log.stat().st_size-131072))
+                        events = re.findall(rb'EVENT: (CONNECTED|RECONNECTING|TRANSPORT_ERROR|DISCONNECTED|AUTH_FAILED|AUTH_PENDING)\b', source.read())
+                    if events and events[-1] != b'CONNECTED':
+                        result['state'] = 'disconnected' if events[-1] in (b'DISCONNECTED',b'AUTH_FAILED') else 'connecting'
+                        if action != 'status':
+                            result.update(ok=False,code='core_transport_not_connected')
             if action == 'status':
                 result['credentials_ready'] = not self.config.get('use_saved_credentials') or bool(self.config.get('credentials_digest'))
             if action != 'status':
