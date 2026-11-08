@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>VPN · Frog Assistant</title>
+  <link rel="stylesheet" href="/vpn/style.css">
+  <script src="/vpn/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <div class="brand">Frog Assistant</div>
+    <section class="card" aria-labelledby="title">
+      <h1 id="title">Вход в VPN</h1>
+      <p class="intro">Сохрани логин и пароль один раз для подключения на Mac и VPS.</p>
+      <div id="notice" role="status" aria-live="polite">Проверяем ссылку…</div>
+      <form id="credentials">
+        <fieldset disabled>
+          <label for="username">Логин</label>
+          <input id="username" name="username" autocomplete="username" spellcheck="false" required maxlength="1024">
+          <label for="password">Пароль</label>
+          <div class="password">
+            <input id="password" name="password" type="password" autocomplete="off" required maxlength="1024">
+            <button id="reveal" type="button" aria-pressed="false">Показать</button>
+          </div>
+          <button class="primary" type="submit">Сохранить реквизиты</button>
+        </fieldset>
+      </form>
+      <p class="detail">Пароль не попадает в чат. Запросы Multifactor подтверждаешь ты.</p>
+      <div id="success" hidden><p>Вернись в Frog Assistant и напиши <strong>«переподключись»</strong>.</p></div>
+    </section>
+    <p class="footer">Одноразовая ссылка · 10 минут</p>
+  </main>
+</body>
+</html>
