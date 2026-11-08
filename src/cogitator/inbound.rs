@@ -10,6 +10,7 @@ use crate::{
     commands::{help, parse, seed},
     sessions::SessionContext,
     sessions::SessionEnded,
+    vpn::{action as vpn_action, enabled as vpn_enabled, execute as vpn_execute},
 };
 
 impl AlbertCogitator {
@@ -120,6 +121,14 @@ impl AlbertCogitator {
         input: UserInput,
         ctx: &CogitatorContext,
     ) {
+        // This control plane never enters a model turn or retained reply history.
+        if input.images.is_empty() && vpn_enabled(&input.text) {
+            if let Some(action) = vpn_action(&input.text) {
+                let reply = vpn_execute(action, &incoming).await;
+                self.emit_reply(&incoming, reply, ctx).await;
+                return;
+            }
+        }
         // Reflexes fire on text-only turns: instant, no LLM.
         if input.images.is_empty() && tag(&incoming, "forwarded") != Some("true") {
             let owner = is_owner(&incoming);

@@ -33,6 +33,7 @@ mod sql;
 mod status;
 mod subagents;
 mod transport;
+mod vpn;
 
 use std::{
     env::{args, set_var, var},
