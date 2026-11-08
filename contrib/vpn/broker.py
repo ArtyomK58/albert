@@ -69,7 +69,7 @@ class Broker:
                 remaining = max(0, int(start + self.config['session_seconds'] - time.time()))
                 text += f'; ориентировочно {remaining // 3600} ч {(remaining % 3600) // 60} мин до повторного входа'
             elif state == 'connected':
-                text += '; срок неизвестен до первого входа через Frog'
+                text += '; остаток сессии пока не определён'
             lines.append(text)
         if not self.credentials.load():
             lines.append('Реквизиты нужно сохранить один раз: /vpn_setup')
@@ -100,12 +100,15 @@ class Broker:
         # This field is supplied only by the deterministic host adapter.
         if str(request.get('actor')) != str(self.config['owner_id']):
             return {'ok': False, 'text': 'Управление VPN доступно только владельцу.'}
-        if self.config.get('maintenance'):
+        if self.config.get('maintenance') and request.get('action') != 'status':
             return {'ok': False, 'text': self.config.get('maintenance_message',
                     'Автоматическое управление VPN временно приостановлено для проверки устойчивости. Используй штатный клиент OpenVPN.')}
         action = request.get('action')
         if action == 'status':
-            return self.status()
+            result = self.status()
+            if self.config.get('maintenance'):
+                result['text'] += '\nАвтоподключение временно заблокировано; доступна только проверка состояния.'
+            return result
         if action == 'setup':
             return self.setup()
         if action not in ('connect', 'reconnect'):

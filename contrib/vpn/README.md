@@ -57,7 +57,8 @@ Create the runtime socket directory early at boot before starting a container
 that bind-mounts it.
 
 Set `maintenance` to block control requests and notifications during an incident;
-`maintenance_message` explains this state without attempting another login.
+read-only status remains available. `maintenance_message` explains this state
+without attempting another login.
 The operator must set `simultaneous_verified` only after an attended sustained
 test; login is fail-closed before that gate is satisfied.
 Validate simultaneous sessions over a sustained observation period. Some servers

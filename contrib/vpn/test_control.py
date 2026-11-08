@@ -102,6 +102,8 @@ class BrokerTests(unittest.TestCase):
         self.broker.tick()
         self.assertEqual(self.targets.calls,[])
         self.assertEqual(self.notifications,[])
+        self.assertTrue(self.broker.handle({'actor':7,'action':'status'})['ok'])
+        self.assertEqual(self.targets.calls,[])
 
     def test_unverified_simultaneous_sessions_never_start(self):
         self.config['simultaneous_verified']=False
